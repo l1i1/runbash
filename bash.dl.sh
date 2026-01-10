@@ -2,9 +2,9 @@
 
 # 简化版 URL 并发测试脚本 (使用 wget)
 # 核心配置
-NUMBER=100                # 总请求次数
+NUMBER=160                # 总请求次数
 URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 测试URL
-MAX_CONCURRENT=100        # 最大并发数
+MAX_CONCURRENT=8        # 最大并发数
 LOG_FILE="download.log"   # 错误日志文件
 
 # 初始化变量
