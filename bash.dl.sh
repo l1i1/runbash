@@ -3,7 +3,7 @@
 #  URL 并发测试脚本 
 # 核心配置
 NUMBER=3200                # 总请求次数
-MAX_CONCURRENT=8        # 最大并发数
+MAX_CONCURRENT=16        # 最大并发数
 URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 测试URL
 
 LOG_FILE="download.log"   # 错误日志文件
