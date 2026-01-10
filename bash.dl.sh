@@ -1,13 +1,16 @@
 #!/bin/bash
 
-# 修复版 URL 并发测试脚本 (使用 wget)
+#  URL 并发测试脚本 
 # 核心配置
 NUMBER=160                # 总请求次数
-URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 测试URL
 MAX_CONCURRENT=8        # 最大并发数
+URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 测试URL
+
 LOG_FILE="download.log"   # 错误日志文件
 TEMP_COUNT="/tmp/wget_test_count"  # 临时计数文件
 
+# 初始化计时（用于统计总耗时）
+start_time=$(date +%s)
 # 初始化变量/文件
 > "$LOG_FILE"             # 清空错误日志
 echo 0 > "$TEMP_COUNT"    # 初始化计数文件
@@ -49,7 +52,29 @@ done
 wait
 # 读取最终完成数
 final_completed=$(cat "$TEMP_COUNT")
-echo -e "\n测试完成！最终进度: $final_completed/$NUMBER (100%)"
+# 计算结束时间和总耗时
+end_time=$(date +%s)
+total_seconds=$((end_time - start_time))
+# 计算失败数和失败率（保留两位小数）
+failed=$((NUMBER - final_completed))
+if (( NUMBER > 0 )); then
+    success_rate=$(echo "scale=2; $final_completed / $NUMBER * 100" | bc)
+    fail_rate=$(echo "scale=2; $failed / $NUMBER * 100" | bc)
+else
+    success_rate=0.00
+    fail_rate=0.00
+fi
+
+# 输出控制台最终结果
+echo -e "\n==================== 测试完成 ===================="
+echo "总请求数:         $NUMBER"
+echo "最大并发数:       $MAX_CONCURRENT"
+echo "成功请求数:       $final_completed"
+echo "失败请求数:       $failed"
+echo "成功率:           $success_rate%"
+echo "失败率:           $fail_rate%"
+echo "总耗时:           $total_seconds 秒"
+echo "=================================================="
 
 # 显示错误日志（如果有错误）
 if [[ -s "$LOG_FILE" ]]; then
