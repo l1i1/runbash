@@ -1,96 +1,57 @@
 #!/bin/bash
 
-# URL 并发测试
+# 简化版 URL 并发测试脚本 (使用 wget)
+# 核心配置
+NUMBER=100                # 总请求次数
+URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 测试URL
+MAX_CONCURRENT=100        # 最大并发数
+LOG_FILE="download.log"   # 错误日志文件
 
-NUMBER=100  # 下载次数
-URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 替换为实际的 URL
-MAX_CONCURRENT=100  # 最大并行下载数量
-isParallel=true    # 并行执行标志，默认为 true
-aria2Arg="--allow-overwrite=true --file-allocation=none --disk-cache=0"
-isLargeFile=false  # 根据需要设置为 true 或 false
+# 初始化变量
+completed=0
+prev_percentage=0
+count=0
 
-declare -a jobs  # 用于跟踪后台作业的数组
-count=0  # 用于记录输出的百分比数量
+# 清空旧日志
+> "$LOG_FILE"
 
-# 并行下载函数
-parallel_download() {
-    local job_count=0
-    local completed=0
-    for url in "$@"; do
-        if [[ "$isLargeFile" == "true" ]]; then
-            aria2c -s 32 -x 16 -d "/dev" -o "null" "$url" $aria2Arg > "/dev/null" 2>&1 &
-            if [ $? -eq 0 ]; then
-                ((completed++))
-            else
-                echo "Aria2c download failed for $url" >> download.log
-            fi
-        else
-            curl -fsSL "$url" > "/dev/null" 2>&1 &
-            if [ $? -eq 0 ]; then
-                ((completed++))
-            else
-                echo "Curl download failed for $url" >> download.log
-            fi
-        fi
-        ((job_count++))
-        if [[ "$job_count" -ge "$MAX_CONCURRENT" ]]; then
-            wait -n
-            jobs=($(jobs -r))  # 更新 jobs 数组，移除已完成的作业
-            job_count=0
-        fi
-        # 计算百分比
-        percentage=$((completed * 100 / NUMBER))
-        # 只有在百分比整数变化且输出数量未超过 100 时才输出
-        if [[ $((percentage * 100)) -gt $((prev_percentage * 100)) && $count -lt 100 ]]; then
-            echo "Progress: $completed / $NUMBER ($percentage%)"
-            ((count++))
-            prev_percentage=$percentage
-        fi
-    done
-    if [[ "$job_count" -gt 0 ]]; then
-        wait
-    fi
+# 并发执行函数
+run_request() {
+    local url=$1
+    # 使用wget静默下载，输出到空设备，仅记录错误
+    wget -q -O /dev/null --no-cache "$url" 2>> "$LOG_FILE"
+    # 原子操作更新完成数（避免并发冲突）
+    ((completed++))
 }
 
-# 根据 number 字段的值，循环运行下载操作
-prev_percentage=0
+# 主测试逻辑
+echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
 for ((i=0; i<NUMBER; i++)); do
-    if [[ "$isParallel" == "true" ]]; then
-        parallel_download "$URL"
-    else
-        if [[ "$isLargeFile" == "true" ]]; then
-            aria2c -s 32 -x 16 -d "/dev" -o "null" "$URL" $aria2Arg > "/dev/null" 2>&1
-            if [ $? -eq 0 ]; then
-                ((completed++))
-            else
-                echo "Aria2c sequential download failed" >> download.log
-            fi
-        else
-            curl -fsSL "$URL" > "/dev/null" 2>&1
-            if [ $? -eq 0 ]; then
-                ((completed++))
-            else
-                echo "Curl sequential download failed" >> download.log
-            fi
-        fi
-        # 计算百分比
-        percentage=$((completed * 100 / NUMBER))
-        # 只有在百分比整数变化且输出数量未超过 100 时才输出
-        if [[ $((percentage * 100)) -gt $((prev_percentage * 100)) && $count -lt 100 ]]; then
-            echo "Progress: $completed / $NUMBER ($percentage%)"
-            ((count++))
-            prev_percentage=$percentage
-        fi
+    # 启动后台请求
+    run_request "$URL" &
+    
+    # 控制并发数：当后台进程数达到上限时，等待任意一个完成
+    while (( $(jobs -r | wc -l) >= MAX_CONCURRENT )); do
+        wait -n
+    done
+
+    # 进度显示（仅整数百分比变化时输出）
+    percentage=$((completed * 100 / NUMBER))
+    if (( percentage > prev_percentage && count < 100 )); then
+        echo "进度: $completed/$NUMBER ($percentage%)"
+        prev_percentage=$percentage
+        ((count++))
     fi
 done
 
-# 如果是并行执行，等待所有后台作业完成
-if [[ "$isParallel" == "true" ]]; then
-    wait
-    echo "All downloads have finished."
-fi
+# 等待所有剩余后台进程完成
+wait
+echo -e "\n测试完成！最终进度: $completed/$NUMBER (100%)"
 
-# 打印 download.log 的内容
-if [ -f "download.log" ]; then
-    cat download.log
+# 显示错误日志（如果有错误）
+if [[ -s "$LOG_FILE" ]]; then
+    echo -e "\n错误日志内容:"
+    cat "$LOG_FILE"
+else
+    echo -e "\n无错误发生！"
 fi
