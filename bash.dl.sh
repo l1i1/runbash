@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# URL 并发测试脚本
+# URL 并发测试脚本（使用 Curl 无 I/O 瓶颈版 - 终极修复版）
 # 核心配置
-NUMBER=3200                # 总请求次数
+NUMBER=32000                # 总请求次数
 MAX_CONCURRENT=16          # 最大并发数
-URL="https://sc.sysri.cn/_def/other/test/IMG20251108113913.jpg?origpic"  # 测试URL
+URL="https://www.8uid.com/wp-content/uploads/2024/06/20240630005115267-%E9%9A%90%E7%A7%81%E6%94%BF%E7%AD%96.png"  # 测试URL
 
 LOG_FILE="download.log"    # 错误日志文件
 TEMP_COUNT="/tmp/curl_test_count"  # 临时计数文件
@@ -30,7 +30,8 @@ increment_counter() {
     local count_file="$1"
     (
         flock -x 200
-        current=$(cat "$count_file")
+        # 读取当前值，如果文件为空则默认为0
+        current=$(cat "$count_file" 2>/dev/null || echo 0)
         echo $((current + 1)) > "$count_file"
     ) 200>"${count_file}.lock"
 }
@@ -39,7 +40,8 @@ increment_counter() {
 add_bytes() {
     local bytes_file="$1"
     local bytes_to_add="$2"
-    # 确保是纯数字
+    
+    # 数据清洗：确保只保留数字
     bytes_to_add=${bytes_to_add//[^0-9]/}
     
     (
@@ -50,14 +52,14 @@ add_bytes() {
     ) 200>"${bytes_file}.lock"
 }
 
-# 格式化流量显示 (修复了浮点数判断错误的版本)
+# 格式化流量显示 (修复浮点数逻辑)
 format_bytes() {
     local bytes=$1
     local units=('B' 'KB' 'MB' 'GB' 'TB')
     local unit=0
     local display_val=$bytes
     
-    # 使用整数进行循环判断，避免浮点数报错
+    # 使用整数进行循环判断，避免 (( )) 中出现浮点数
     while (( bytes >= 1024 && unit < ${#units[@]} - 1 )); do
         # 计算显示用的浮点数值
         display_val=$(awk "BEGIN {printf \"%.2f\", $bytes / 1024}")
@@ -69,55 +71,59 @@ format_bytes() {
     echo "${display_val} ${units[$unit]}"
 }
 
-# 核心修改：使用 Curl 的单个请求执行函数
+# 单个请求执行函数 (使用 Curl)
 run_request() {
     local url=$1
     local output_info
     local http_code
     local downloaded_bytes
 
-    # 使用 curl 获取数据：
-    # -o /dev/null    : 丢弃内容，不写磁盘（消除 I/O 瓶颈）
-    # -s              : 静默模式，不显示进度条
-    # -w              : 自定义输出格式
-    # %{size_download}: 下载的字节数
-    # %{http_code}    : HTTP 状态码
-    # --max-time 30   : 最长等待时间
-    # 2>> "$LOG_FILE" : 将错误信息重定向到日志
+    # curl 参数说明:
+    # -o /dev/null    : 丢弃内容，不写磁盘，消除I/O瓶颈
+    # -s              : 静默模式
+    # -w              : 输出格式
+    # --max-time 30   : 整个请求超时时间
+    # --connect-timeout 10 : 连接超时时间
     
     output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
                   --max-time 30 --connect-timeout 10 "$url" 2>> "$LOG_FILE")
 
-    # 解析输出 (第一行是字节数，第二行是状态码)
+    # 解析输出
     downloaded_bytes=$(echo "$output_info" | head -n1)
     http_code=$(echo "$output_info" | tail -n1)
 
     # 判断逻辑: 
-    # 1. http_code 必须是数字
-    # 2. 状态码在 200-399 之间视为成功
+    # 1. http_code 必须是数字 (防止 curl 输出异常文本)
+    # 2. 状态码 200-399 视为成功
     if [[ "$http_code" =~ ^[0-9]+$ ]] && (( http_code >= 200 && http_code < 400 )); then
         increment_counter "$TEMP_COUNT"
-        # 累加流量
         add_bytes "$TEMP_BYTES" "$downloaded_bytes"
     fi
 }
 
 # 主测试逻辑
 echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
+echo "URL: $URL"
 echo "=================================================="
 
 for ((i=1; i<=NUMBER; i++)); do
     # 启动后台请求
     run_request "$URL" &
     
-    # 控制并发数
+    # 控制并发数 (等待任意一个后台任务结束)
     while (( $(jobs -r | wc -l) >= MAX_CONCURRENT )); do
         wait -n 2>/dev/null || true
     done
 
-    # 显示进度
+    # 显示进度 (每100次或每增加5%显示一次)
     completed=$(cat "$TEMP_COUNT")
-    percentage=$((completed * 100 / NUMBER))
+    # 防止除以0
+    if (( NUMBER > 0 )); then
+        percentage=$((completed * 100 / NUMBER))
+    else
+        percentage=0
+    fi
+
     if (( i % 100 == 0 || percentage > prev_percentage + 4 )); then
         if (( percentage != prev_percentage )); then
             current_bytes=$(cat "$TEMP_BYTES")
@@ -133,7 +139,8 @@ wait
 
 # 读取最终完成数和总流量
 final_completed=$(cat "$TEMP_COUNT")
-total_bytes=$(cat "$TEMP_BYTES"))
+# *** 已修复：此处去掉了多余的右括号 ***
+total_bytes=$(cat "$TEMP_BYTES")
 
 # 计算结束时间和总耗时
 end_time=$(date +%s)
