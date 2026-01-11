@@ -32,6 +32,26 @@ running_jobs=0
 CLEANUP_CALLED=0
 TRAP_TRIGGERED=0
 
+# 获取远程服务器IP（目标URL解析后的IP）
+get_remote_ip() {
+    local ip=""
+    ip=$(curl -o /dev/null -s -w '%{remote_ip}' \
+              --max-time 10 --connect-timeout 5 \
+              "$URL" 2>> "$LOG_FILE")
+    echo "${ip:-未知}"
+}
+
+# 获取本机出口IP（公网IP）
+get_local_ip() {
+    local ip=""
+    # 优先尝试 ifconfig.me，失败可换成 icanhazip.com 等服务
+    ip=$(curl -s -4 --max-time 5 ifconfig.me 2>> "$LOG_FILE")
+    echo "${ip:-未知}"
+}
+
+REMOTE_IP=$(get_remote_ip)
+LOCAL_IP=$(get_local_ip)
+
 # 清理函数
 cleanup() {
     [[ "$CLEANUP_CALLED" == "1" ]] && return
@@ -90,7 +110,9 @@ echo 0 > "$TEMP_BYTES" 2>/dev/null || true
 
 # 主循环
 echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
-echo "URL: $URL"
+echo "URL:        $URL"
+echo "远程IP:     $REMOTE_IP"
+echo "本地IP:     $LOCAL_IP"
 echo "临时文件目录: $TEMP_DIR"
 echo "=================================================="
 
@@ -107,7 +129,7 @@ while (( total_initiated < NUMBER )); do
                 current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
                 current_mb=$((current_bytes / 1024 / 1024))
                 current_mb_frac=$(awk "BEGIN {printf \"%.2f\", $current_bytes / 1024 / 1024}")
-                echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: ${current_mb_frac}MB"
+                echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: ${current_mb_frac}MB | 远程IP: $REMOTE_IP | 本地IP: $LOCAL_IP"
                 prev_percentage=$percentage
             fi
         fi
@@ -134,6 +156,9 @@ calc_total_mb=$(awk "BEGIN {printf \"%.2f\", $total_bytes / 1024 / 1024}")
 
 # 输出结果
 echo -e "\n==================== 测试完成 ===================="
+echo "远程IP:     $REMOTE_IP"
+echo "本地IP:     $LOCAL_IP"
+echo "URL:        $URL"
 echo "总请求数:   $NUMBER"
 echo "成功请求:   $final_completed"
 echo "失败请求:   $failed"
