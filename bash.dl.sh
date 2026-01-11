@@ -81,7 +81,7 @@ run_request() {
 
 # 主测试逻辑
 echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
-echo "URL: $URL"
+# echo "URL: $URL"
 echo "=================================================="
 
 for ((i=1; i<=NUMBER; i++)); do
