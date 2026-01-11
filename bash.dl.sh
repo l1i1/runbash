@@ -115,13 +115,11 @@ get_remote_ip() {
     echo "${remote_ip:-未知}"
 }
 
-# 3. 获取远程主机IP（解析测试URL）
-get_remote_host_ip() {
-    local url="$1"
-    local host=""
-    
+# 3. DNS 解析辅助函数（备用方案）
+resolve_dns_ip() {
+    local host="$1"
     # 从URL中提取主机名
-    host=$(echo "$url" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
+    host=$(echo "$host" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
     
     # 解析主机IP
     if command -v host &> /dev/null; then
@@ -133,6 +131,29 @@ get_remote_host_ip() {
     else
         echo "未知"
     fi
+}
+
+# 4. 获取最终目标IP（核心更新：跟随302获取真实连接IP）
+get_final_target_ip() {
+    local url="$1"
+    local final_ip=""
+
+    # 尝试方法1: 使用 curl 实际发起请求并跟随跳转，获取连接的真实IP
+    # -I: 仅请求头（HEAD请求），不下载文件内容，速度快
+    # -L: 跟随重定向 (关键)
+    # -w: 输出 remote_ip (curl 连接到的实际 IP)
+    # --max-time: 防止卡死
+    final_ip=$(curl -sIL -w '%{remote_ip}' -o /dev/null --max-time 5 --connect-timeout 3 "$url" 2>/dev/null)
+
+    # 简单验证返回的字符串是否像IP地址
+    if [[ "$final_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "$final_ip"
+        return
+    fi
+
+    # 尝试方法2: 如果方法1失败（例如服务器不支持HEAD请求或网络问题），回退到DNS解析
+    # 这将解析初始URL的域名，可能不是最终CDN IP，但比"未知"好
+    echo "$(resolve_dns_ip "$url")"
 }
 
 # ===================== 初始化环境变量 =====================
@@ -153,7 +174,8 @@ TEMP_BYTES="${TEMP_DIR}/curl_test_bytes_${SCRIPT_PID}"  # 流量统计文件
 # 获取IP信息
 LOCAL_IP=$(get_local_ip)
 REMOTE_PUBLIC_IP=$(get_remote_ip)
-REMOTE_HOST_IP=$(get_remote_host_ip "$URL")
+# 使用新函数获取最终目标IP
+REMOTE_HOST_IP=$(get_final_target_ip "$URL")
 
 # ===================== 全局状态变量 =====================
 start_time=$(date +%s)
@@ -306,7 +328,7 @@ echo "=================================================="
 echo "网络配置信息:"
 echo "  本地IP:          $LOCAL_IP"
 echo "  公网IP:          $REMOTE_PUBLIC_IP"
-echo "  目标服务器IP:    $REMOTE_HOST_IP"
+echo "  目标服务器IP:    $REMOTE_HOST_IP (已解析302最终地址)"
 echo "=================================================="
 
 # 核心循环：发起请求+控制并发
@@ -367,7 +389,7 @@ echo -e "\n==================== 测试完成 ===================="
 echo "网络配置:"
 echo "  本地IP:          $LOCAL_IP"
 echo "  公网IP:          $REMOTE_PUBLIC_IP"
-echo "  目标服务器IP:    $REMOTE_HOST_IP"
+echo "  目标服务器IP:    $REMOTE_HOST_IP (最终连接IP)"
 echo "---------------------------------------------------"
 echo "测试配置:"
 echo "  总请求数:         $NUMBER"
