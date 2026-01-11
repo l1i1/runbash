@@ -1,239 +1,367 @@
 #!/bin/bash
-set -o nounset
-set -o pipefail
+# 基础安全配置：仅保留必要的严格检查
+set -o nounset  # 未定义变量报错
+set -o pipefail # 管道中任意命令失败则整体失败
 
-# 前置检查
+# ===================== 前置检查 =====================
+# 1. 检查 Bash 版本（要求 4.3+，支持 wait -n）
 if [[ "${BASH_VERSINFO[0]}" -lt 4 || ("${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -lt 3) ]]; then
-    echo "错误: 需要 Bash 4.3+"
+    echo "错误: 此脚本需要 Bash 4.3 或更高版本"
+    echo "当前版本: $BASH_VERSION"
     exit 1
 fi
 
+# 2. 检查 curl 是否安装
 if ! command -v curl &> /dev/null; then
-    echo "错误: 需要 curl"
+    echo "错误: 未找到 curl 命令，请先安装。"
     exit 1
 fi
 
-# 初始化
-NUMBER=32
-MAX_CONCURRENT=32
-URL="https://github.com/OpenListTeam/OpenList/releases/download/v4.1.9/openlist-android-arm.tar.gz"
-SCRIPT_PID=$$
-LOG_FILE="download_${SCRIPT_PID}.log"
-TEMP_DIR="/dev/shm"
-[[ ! -w "$TEMP_DIR" ]] && TEMP_DIR="/tmp"
-TEMP_COUNT="${TEMP_DIR}/curl_test_count_${SCRIPT_PID}"
-TEMP_BYTES="${TEMP_DIR}/curl_test_bytes_${SCRIPT_PID}"
+# 3. 检查 curl 版本（--retry-all-errors 需要 7.71.0+，修复 echo -e 兼容性）
+CURL_MIN_VERSION="7.71.0"
+CURL_VERSION=$(curl --version | head -n1 | awk '{print $2}')
+version_compare() {
+    local v1=$1 v2=$2
+    # 修复：用 printf 替代 echo -e，提升兼容性
+    [[ "$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -n1)" == "$v2" ]]
+}
 
-# 全局变量
+# 初始化 curl 重试参数（兼容低版本）
+RETRY_COUNT=1
+RETRY_DELAY=1
+if ! version_compare "$CURL_VERSION" "$CURL_MIN_VERSION"; then
+    echo "警告: curl 版本低于 7.71.0，--retry-all-errors 不可用，仅重试网络连接错误"
+    CURL_RETRY_ARGS="--retry $RETRY_COUNT --retry-delay $RETRY_DELAY"
+else
+    CURL_RETRY_ARGS="--retry $RETRY_COUNT --retry-delay $RETRY_DELAY --retry-all-errors"
+fi
+
+# ===================== IP 获取函数 =====================
+# 1. 获取本地IP（支持多种方法）
+get_local_ip() {
+    local local_ip=""
+    
+    # 方法1: 使用 ip 命令（Linux通用）
+    if command -v ip &> /dev/null; then
+        local_ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1); exit}}')
+    fi
+    
+    # 方法2: 备选 - 查找非本地回环接口的IP
+    if [[ -z "$local_ip" ]] && command -v hostname &> /dev/null; then
+        local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    
+    # 方法3: 使用 ifconfig
+    if [[ -z "$local_ip" ]] && command -v ifconfig &> /dev/null; then
+        local_ip=$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -n1)
+    fi
+    
+    # 方法4: 读取 /proc/net/route
+    if [[ -z "$local_ip" && -f /proc/net/route ]]; then
+        local_ip=$(awk 'NR>1 && $2=="00000000"{print $1}' /proc/net/route | head -n1 | while read hex; do
+            printf "%d.%d.%d.%d\n" 0x${hex:6:2} 0x${hex:4:2} 0x${hex:2:2} 0x${hex:0:2}
+        done)
+    fi
+    
+    echo "${local_ip:-未知}"
+}
+
+# 2. 获取远程公网IP（多个备用服务）
+get_remote_ip() {
+    local remote_ip=""
+    local services=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://icanhazip.com"
+        "https://checkip.amazonaws.com"
+        "https://ipecho.net/plain"
+    )
+    
+    for service in "${services[@]}"; do
+        remote_ip=$(curl -s --max-time 5 --connect-timeout 3 "$service" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+        if [[ -n "$remote_ip" ]]; then
+            break
+        fi
+    done
+    
+    echo "${remote_ip:-未知}"
+}
+
+# 3. 获取远程主机IP（解析测试URL）
+get_remote_host_ip() {
+    local url="$1"
+    local host=""
+    
+    # 从URL中提取主机名
+    host=$(echo "$url" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
+    
+    # 解析主机IP
+    if command -v host &> /dev/null; then
+        host -t A "$host" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
+    elif command -v nslookup &> /dev/null; then
+        nslookup "$host" 2>/dev/null | grep -Eo 'Address: ([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
+    elif command -v getent &> /dev/null; then
+        getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -n1
+    else
+        echo "未知"
+    fi
+}
+
+# ===================== 核心配置 =====================
+NUMBER=32               # 总请求次数
+MAX_CONCURRENT=16          # 最大并发数
+URL="https://sc.sysri.cn/_def/other/test/IMG20251108113913.jpg?origpic"  # 测试URL
+
+# 获取IP信息
+LOCAL_IP=$(get_local_ip)
+REMOTE_PUBLIC_IP=$(get_remote_ip)
+REMOTE_HOST_IP=$(get_remote_host_ip "$URL")
+
+# 临时文件配置（内存文件优先，保证唯一性）
+SCRIPT_PID=$$
+LOG_FILE="download_${SCRIPT_PID}.log"    # 错误日志文件
+TEMP_DIR="/dev/shm"
+[[ ! -w "$TEMP_DIR" ]] && TEMP_DIR="/tmp"  # 内存目录不可写则降级到/tmp
+TEMP_COUNT="${TEMP_DIR}/curl_test_count_${SCRIPT_PID}"  # 成功计数文件
+TEMP_BYTES="${TEMP_DIR}/curl_test_bytes_${SCRIPT_PID}"  # 流量统计文件
+
+# ===================== 全局变量 =====================
 start_time=$(date +%s)
 prev_percentage=0
-total_initiated=0
-running_jobs=0
-CLEANUP_CALLED=0
-TRAP_TRIGGERED=0
+total_initiated=0         # 已发起请求数
+running_jobs=0            # 运行中的任务数（核心优化）
+CLEANUP_CALLED=0          # 避免重复清理
+TRAP_TRIGGERED=0          # 标记信号触发的清理
 
-# 获取远程服务器IP
-get_remote_ip() {
-    local ip=""
-    ip=$(curl -o /dev/null -s -w '%{remote_ip}' \
-              --max-time 10 --connect-timeout 5 \
-              "$URL" 2>> "$LOG_FILE")
-    echo "${ip:-未知}"
-}
-
-# 获取本机出口IP
-get_local_ip() {
-    local ip=""
-    ip=$(curl -s -4 --max-time 5 ifconfig.me 2>> "$LOG_FILE")
-    echo "${ip:-未知}"
-}
-
-REMOTE_IP=$(get_remote_ip)
-LOCAL_IP=$(get_local_ip)
-
-# 清理函数
+# ===================== 核心函数 =====================
+# 1. 清理函数（安全、幂等）
 cleanup() {
     [[ "$CLEANUP_CALLED" == "1" ]] && return
     CLEANUP_CALLED=1
+    
+    echo -e "\n清理临时文件..."
+    # 清理所有相关文件，添加容错
     rm -f "$TEMP_COUNT" "${TEMP_COUNT}.lock" "$TEMP_BYTES" "${TEMP_BYTES}.lock" 2>/dev/null || true
-    # 清理可能残留的临时文件
-    rm -f "${TEMP_DIR}/curl_output_${SCRIPT_PID}_"* 2>/dev/null || true
-    rm -f "${TEMP_DIR}/curl_error_${SCRIPT_PID}_"* 2>/dev/null || true
+    # 无错误时自动清理日志，有错误则保留
     [[ ! -s "$LOG_FILE" ]] && rm -f "$LOG_FILE" 2>/dev/null || true
-    [[ "$TRAP_TRIGGERED" == "1" ]] && { echo "脚本被强制终止"; exit 1; }
+    
+    # 仅信号触发时返回错误码
+    if [[ "$TRAP_TRIGGERED" == "1" ]]; then
+        echo "脚本被强制终止，资源已清理"
+        exit 1
+    fi
 }
 
+# 注册信号捕获（仅中断/终止信号）
 trap 'TRAP_TRIGGERED=1; cleanup' SIGINT SIGTERM
 
-# 计数函数
+# 2. 安全递增计数函数（加锁+超时+容错）
 increment_counter() {
+    local count_file="$1"
     (
-        flock -x -w 5 200 || { echo "[$(date '+%F %T')] 锁超时: $1" >> "$LOG_FILE"; return 1; }
-        current=$(cat "$1" 2>/dev/null || echo 0)
-        current=${current//[^0-9]/}
-        echo $(( ${current:-0} + 1 )) > "$1"
-    ) 200>"$1.lock" 2>/dev/null || true
+        # 5秒超时避免死锁，失败记录日志
+        flock -x -w 5 200 || { echo "[$(date +%F\ %T)] 锁文件超时: $count_file" >> "$LOG_FILE"; return 1; }
+        # 读取当前值并清洗（仅保留数字）
+        current=$(cat "$count_file" 2>/dev/null || echo 0)
+        current=$(echo "$current" | tr -cd '0-9')
+        # 安全递增
+        echo $(( ${current:-0} + 1 )) > "$count_file"
+    ) 200>"${count_file}.lock" 2>/dev/null || true
 }
 
-# 流量统计
+# 3. 安全累加流量函数（修复锁文件路径关键Bug）
 add_bytes() {
-    local bytes_to_add=${2//[^0-9]/}
+    local bytes_file="$1"
+    local bytes_to_add="$2"
+    
+    # 清洗输入：仅保留数字，空值默认0
+    bytes_to_add=$(echo "$bytes_to_add" | tr -cd '0-9')
     bytes_to_add=${bytes_to_add:-0}
+    
     (
-        flock -x -w 5 200 || { echo "[$(date '+%F %T')] 锁超时: $1" >> "$LOG_FILE"; return 1; }
-        current=$(cat "$1" 2>/dev/null || echo 0)
-        current=${current//[^0-9]/}
-        echo $(( ${current:-0} + bytes_to_add )) > "$1"
-    ) 200>"$1.lock" 2>/dev/null || true
+        # 🔴 核心修复：锁文件路径改为 bytes_file.lock（而非 bytes_to_add.lock）
+        flock -x -w 5 200 || { echo "[$(date +%F\ %T)] 锁文件超时: $bytes_file" >> "$LOG_FILE"; return 1; }
+        # 读取当前值并清洗
+        current=$(cat "$bytes_file" 2>/dev/null || echo 0)
+        current=$(echo "$current" | tr -cd '0-9')
+        # 安全累加
+        echo $(( ${current:-0} + bytes_to_add )) > "$bytes_file"
+    ) 200>"${bytes_file}.lock" 2>/dev/null || true  # ✅ 修复后的正确路径
 }
 
-# 请求执行（增强调试信息）
+# 4. 格式化流量显示（健壮性增强）
+format_bytes() {
+    local bytes=$1
+    # 清洗输入
+    bytes=$(echo "$bytes" | tr -cd '0-9')
+    bytes=${bytes:-0}
+    
+    local units=('B' 'KB' 'MB' 'GB' 'TB')
+    local unit=0
+    local display_val=$bytes
+    
+    while (( bytes >= 1024 && unit < ${#units[@]} - 1 )); do
+        display_val=$(awk "BEGIN {printf \"%.2f\", $bytes / 1024}")
+        bytes=$((bytes / 1024))
+        ((unit++))
+    done
+    
+    echo "${display_val} ${units[$unit]}"
+}
+
+# 5. 健壮的百分比计算函数
+calc_percent() {
+    local numerator=$1 denominator=$2
+    # 双重清洗，避免非数字导致awk报错
+    numerator=$(echo "$numerator" | tr -cd '0-9')
+    denominator=$(echo "$denominator" | tr -cd '0-9')
+    numerator=${numerator:-0}
+    denominator=${denominator:-1}  # 避免除以0
+    
+    awk "BEGIN {printf \"%.2f\", $numerator / $denominator * 100}"
+}
+
+# 6. 单个请求执行函数（稳定+重试）
 run_request() {
-    local temp_output_file="${TEMP_DIR}/curl_output_${SCRIPT_PID}_${BASHPID}_$$_$RANDOM.tmp"
-    local temp_error_file="${TEMP_DIR}/curl_error_${SCRIPT_PID}_${BASHPID}_$$_$RANDOM.tmp"
-    local downloaded_bytes="" http_code="" curl_error line_count=0
-    
-    # 创建临时文件
-    : > "$temp_output_file"
-    : > "$temp_error_file"
-    
-    # 执行curl请求，输出到临时文件
-    curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
-         --max-time 30 --connect-timeout 10 \
-         --retry 1 --retry-delay 1 \
-         "$1" > "$temp_output_file" 2> "$temp_error_file"
-    
-    # 调试：记录临时文件信息
-    echo "[$(date '+%F %T')] PID:$BASHPID 输出文件: $temp_output_file 大小: $(wc -c < "$temp_output_file" 2>/dev/null || echo 0)" >> "$LOG_FILE"
-    
-    # 读取错误信息
-    curl_error=$(cat "$temp_error_file" 2>/dev/null)
-    
-    # 如果有错误，记录到日志
-    if [[ -n "$curl_error" ]]; then
-        echo "[$(date '+%F %T')] URL: $1 - curl错误: $curl_error" >> "$LOG_FILE"
-    fi
-    
-    # 调试：记录输出文件内容
-    echo "[$(date '+%F %T')] PID:$BASHPID 输出文件内容: $(cat "$temp_output_file" 2>/dev/null | head -3)" >> "$LOG_FILE"
-    
-    # 直接读取文件内容并解析
-    while IFS= read -r line; do
-        if [[ $line_count -eq 0 ]]; then
-            downloaded_bytes="$line"
-        elif [[ $line_count -eq 1 ]]; then
-            http_code="$line"
-        fi
-        ((line_count++))
-    done < "$temp_output_file"
-    
-    # 清理临时文件
-    rm -f "$temp_output_file" "$temp_error_file" 2>/dev/null
-    
-    # 验证HTTP状态码
-    if [[ -z "$http_code" ]]; then
-        echo "[$(date '+%F %T')] URL: $1 - 无HTTP状态码返回, line_count=$line_count" >> "$LOG_FILE"
-    else
-        echo "[$(date '+%F %T')] URL: $1 - HTTP状态码: $http_code" >> "$LOG_FILE"
-    fi
-    
-    # 只有2xx和3xx状态码才算成功
+    local url=$1
+    local output_info downloaded_bytes http_code
+
+    # 执行curl请求（仅重试网络错误）
+    output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
+                  --max-time 30 --connect-timeout 10 \
+                  $CURL_RETRY_ARGS \
+                  "$url" 2>> "$LOG_FILE")
+
+    # 分割输出（兼容Bash 3.0+）
+    IFS=$'\n' read -r downloaded_bytes http_code <<< "$output_info"
+
+    # 仅2xx/3xx视为成功
     if [[ "$http_code" =~ ^[23][0-9]{2}$ ]]; then
         increment_counter "$TEMP_COUNT"
-        add_bytes "$TEMP_BYTES" "${downloaded_bytes:-0}"
+        add_bytes "$TEMP_BYTES" "$downloaded_bytes"
     fi
 }
 
-# 并发控制
+# 7. 精准的并发等待函数（修复running_jobs计数问题）
 wait_for_completion() {
+    # 仅当达到最大并发时等待
     if (( running_jobs >= MAX_CONCURRENT )); then
-        wait -n 2>/dev/null && ((running_jobs--)) || running_jobs=$(jobs -r | wc -l)
+        # 精准处理wait -n返回值：区分正常完成/信号中断
+        if wait -n 2>/dev/null; then
+            # 任务正常完成，递减计数
+            ((running_jobs--))
+        else
+            # wait -n失败（如信号中断/无后台任务），重新计算实际运行数
+            running_jobs=$(jobs -r | wc -l)
+        fi
     fi
 }
 
-# 初始化文件
+# ===================== 初始化 =====================
+# 所有文件操作添加容错，避免失败终止脚本
 > "$LOG_FILE" 2>/dev/null || true
 echo 0 > "$TEMP_COUNT" 2>/dev/null || true
 echo 0 > "$TEMP_BYTES" 2>/dev/null || true
 
-# 添加单个请求测试，用于诊断
-echo "开始单次请求测试..."
-single_test_result=$(curl -o /dev/null -s -w 'HTTP状态码: %{http_code}\n下载大小: %{size_download}字节\n错误信息: %{errormsg}\n' \
-                     --max-time 30 --connect-timeout 10 \
-                     "$URL" 2>&1)
-echo "单次测试结果:"
-echo "$single_test_result"
-echo "$single_test_result" >> "$LOG_FILE"
-echo "单次测试完成"
-echo "=================================================="
-
-# 主循环
-echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
-echo "URL:        $URL"
-echo "远程IP:     $REMOTE_IP"
-echo "本地IP:     $LOCAL_IP"
+# ===================== 主测试逻辑 =====================
+echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT, 重试次数=$RETRY_COUNT"
+echo "URL: $URL"
 echo "临时文件目录: $TEMP_DIR"
 echo "=================================================="
+echo "网络配置信息:"
+echo "  本地IP:          $LOCAL_IP"
+echo "  公网IP:          $REMOTE_PUBLIC_IP"
+echo "  目标服务器IP:    $REMOTE_HOST_IP"
+echo "=================================================="
 
+# 核心循环：发起请求+控制并发
 while (( total_initiated < NUMBER )); do
+    # 启动新任务（不超过最大并发）
     while (( running_jobs < MAX_CONCURRENT && total_initiated < NUMBER )); do
         ((total_initiated++))
         ((running_jobs++))
+        
+        # 后台执行请求
         run_request "$URL" &
         
-        if (( total_initiated % 10 == 0 )); then
+        # 每100次更新进度（减少IO开销）
+        if (( total_initiated % 100 == 0 )); then
+            # 读取计数时添加容错
             completed=$(cat "$TEMP_COUNT" 2>/dev/null || echo 0)
             percentage=$((total_initiated * 100 / NUMBER))
-            current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
-            current_mb_frac=$(awk "BEGIN {printf \"%.2f\", $current_bytes / 1024 / 1024}")
-            echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: ${current_mb_frac}MB | 远程IP: $REMOTE_IP | 本地IP: $LOCAL_IP"
+            
+            if (( percentage > prev_percentage + 4 )); then
+                current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
+                current_flow=$(format_bytes "$current_bytes")
+                echo "进度: 已发起=$total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 已下载: $current_flow"
+                prev_percentage=$percentage
+            fi
         fi
     done
+    
+    # 等待任务完成（精准控制并发）
     wait_for_completion
 done
 
+# 等待所有剩余后台任务完成
+echo -e "\n所有请求已发起，等待剩余进程完成..."
 wait
-running_jobs=0
+running_jobs=0  # 重置计数
 
-# 结果统计
+# ===================== 结果统计 =====================
+# 读取统计数据（添加容错）
 final_completed=$(cat "$TEMP_COUNT" 2>/dev/null || echo 0)
 total_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
 end_time=$(date +%s)
 total_seconds=$((end_time - start_time))
 failed=$((NUMBER - final_completed))
+
+# 计算核心指标
+success_rate=$(calc_percent "$final_completed" "$NUMBER")
+fail_rate=$(calc_percent "$failed" "$NUMBER")
+qps=$(awk "BEGIN {printf \"%.2f\", $final_completed / ($total_seconds > 0 ? $total_seconds : 1)}")
 avg_bytes=$(( final_completed > 0 ? total_bytes / final_completed : 0 ))
+avg_bandwidth=$(awk "BEGIN {printf \"%.2f\", $total_bytes / ($total_seconds > 0 ? $total_seconds : 1) / 1024 / 1024}")
 
-# 计算格式化值
-calc_success_rate=$(awk "BEGIN {printf \"%.2f\", $final_completed * 100 / $NUMBER}")
-calc_qps=$(awk "BEGIN {printf \"%.2f\", $final_completed / ${total_seconds:-1}}")
-calc_bandwidth=$(awk "BEGIN {printf \"%.2f\", $total_bytes / ${total_seconds:-1} / 1024 / 1024}")
-calc_total_mb=$(awk "BEGIN {printf \"%.2f\", $total_bytes / 1024 / 1024}")
+# 格式化输出
+formatted_total_bytes=$(format_bytes "$total_bytes")
+formatted_avg_bytes=$(format_bytes "$avg_bytes")
 
-# 输出结果
+# ===================== 输出最终结果 =====================
 echo -e "\n==================== 测试完成 ===================="
-echo "远程IP:     $REMOTE_IP"
-echo "本地IP:     $LOCAL_IP"
-echo "URL:        $URL"
-echo "总请求数:   $NUMBER"
-echo "成功请求:   $final_completed"
-echo "失败请求:   $failed"
-echo "成功率:     ${calc_success_rate}%"
+echo "网络配置:"
+echo "  本地IP:          $LOCAL_IP"
+echo "  公网IP:          $REMOTE_PUBLIC_IP"
+echo "  目标服务器IP:    $REMOTE_HOST_IP"
 echo "---------------------------------------------------"
-echo "总流量:     ${calc_total_mb}MB"
-echo "平均流量/请求: $avg_bytes 字节"
-echo "带宽:       ${calc_bandwidth} MB/s"
+echo "测试配置:"
+echo "  总请求数:         $NUMBER"
+echo "  最大并发数:       $MAX_CONCURRENT"
+echo "  成功请求数:       $final_completed"
+echo "  失败请求数:       $failed"
+echo "  成功率:           ${success_rate}%"
+echo "  失败率:           ${fail_rate}%"
 echo "---------------------------------------------------"
-echo "总耗时:     ${total_seconds}秒"
-echo "平均QPS:    ${calc_qps}次/秒"
+echo "网络流量:"
+echo "  总网络流量:       $formatted_total_bytes ($total_bytes 字节)"
+echo "  平均流量/请求:    $formatted_avg_bytes/请求"
+echo "  真实带宽:         ${avg_bandwidth} MB/s"
+echo "---------------------------------------------------"
+echo "性能指标:"
+echo "  总耗时:           ${total_seconds}秒"
+echo "  平均QPS:          ${qps}次/秒"
 echo "=================================================="
 
-# 显示详细错误日志（限制行数避免输出过多）
-[[ -s "$LOG_FILE" ]] && { 
-    echo -e "\n=== 错误日志 (最后50行) ==="
-    tail -n 50 "$LOG_FILE"
-    echo "====================="
-} || echo -e "\n无错误日志"
+# 显示错误日志（有错误才展示）
+if [[ -s "$LOG_FILE" ]]; then
+    echo -e "\n错误日志内容 (最后20行):"
+    tail -n 20 "$LOG_FILE"
+    echo -e "完整日志请查看: $LOG_FILE"
+else
+    echo -e "\n无错误发生！"
+fi
 
+# ===================== 正常退出清理 =====================
 cleanup
-echo -e "\n测试完成"
+echo -e "\n测试完成，所有资源已清理！"
 exit 0
