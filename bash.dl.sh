@@ -4,7 +4,7 @@
 # 核心配置
 NUMBER=3200                # 总请求次数
 MAX_CONCURRENT=16        # 最大并发数
-URL="https://sc.sysri.cn/other/test/IMG20251108113913.jpg"  # 测试URL
+URL="https://sc.sysri.cn/_def/other/test/IMG20251108113913.jpg?origpic"  # 测试URL
 
 LOG_FILE="download.log"   # 错误日志文件
 TEMP_COUNT="/tmp/wget_test_count"  # 临时计数文件
