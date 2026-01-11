@@ -56,6 +56,9 @@ cleanup() {
     [[ "$CLEANUP_CALLED" == "1" ]] && return
     CLEANUP_CALLED=1
     rm -f "$TEMP_COUNT" "${TEMP_COUNT}.lock" "$TEMP_BYTES" "${TEMP_BYTES}.lock" 2>/dev/null || true
+    # 清理可能残留的临时文件
+    rm -f "${TEMP_DIR}/curl_output_${SCRIPT_PID}_"* 2>/dev/null || true
+    rm -f "${TEMP_DIR}/curl_error_${SCRIPT_PID}_"* 2>/dev/null || true
     [[ ! -s "$LOG_FILE" ]] && rm -f "$LOG_FILE" 2>/dev/null || true
     [[ "$TRAP_TRIGGERED" == "1" ]] && { echo "脚本被强制终止"; exit 1; }
 }
@@ -84,10 +87,10 @@ add_bytes() {
     ) 200>"$1.lock" 2>/dev/null || true
 }
 
-# 请求执行（修复变量作用域问题）
+# 请求执行（增强调试信息）
 run_request() {
-    local temp_output_file="${TEMP_DIR}/curl_output_${SCRIPT_PID}_$$_$RANDOM.tmp"
-    local temp_error_file="${TEMP_DIR}/curl_error_${SCRIPT_PID}_$$_$RANDOM.tmp"
+    local temp_output_file="${TEMP_DIR}/curl_output_${SCRIPT_PID}_${BASHPID}_$$_$RANDOM.tmp"
+    local temp_error_file="${TEMP_DIR}/curl_error_${SCRIPT_PID}_${BASHPID}_$$_$RANDOM.tmp"
     local downloaded_bytes="" http_code="" curl_error line_count=0
     
     # 创建临时文件
@@ -100,6 +103,9 @@ run_request() {
          --retry 1 --retry-delay 1 \
          "$1" > "$temp_output_file" 2> "$temp_error_file"
     
+    # 调试：记录临时文件信息
+    echo "[$(date '+%F %T')] PID:$BASHPID 输出文件: $temp_output_file 大小: $(wc -c < "$temp_output_file" 2>/dev/null || echo 0)" >> "$LOG_FILE"
+    
     # 读取错误信息
     curl_error=$(cat "$temp_error_file" 2>/dev/null)
     
@@ -108,7 +114,10 @@ run_request() {
         echo "[$(date '+%F %T')] URL: $1 - curl错误: $curl_error" >> "$LOG_FILE"
     fi
     
-    # 直接读取文件内容并解析（避免管道子shell问题）
+    # 调试：记录输出文件内容
+    echo "[$(date '+%F %T')] PID:$BASHPID 输出文件内容: $(cat "$temp_output_file" 2>/dev/null | head -3)" >> "$LOG_FILE"
+    
+    # 直接读取文件内容并解析
     while IFS= read -r line; do
         if [[ $line_count -eq 0 ]]; then
             downloaded_bytes="$line"
@@ -123,7 +132,7 @@ run_request() {
     
     # 验证HTTP状态码
     if [[ -z "$http_code" ]]; then
-        echo "[$(date '+%F %T')] URL: $1 - 无HTTP状态码返回" >> "$LOG_FILE"
+        echo "[$(date '+%F %T')] URL: $1 - 无HTTP状态码返回, line_count=$line_count" >> "$LOG_FILE"
     else
         echo "[$(date '+%F %T')] URL: $1 - HTTP状态码: $http_code" >> "$LOG_FILE"
     fi
@@ -218,10 +227,10 @@ echo "总耗时:     ${total_seconds}秒"
 echo "平均QPS:    ${calc_qps}次/秒"
 echo "=================================================="
 
-# 显示详细错误日志
+# 显示详细错误日志（限制行数避免输出过多）
 [[ -s "$LOG_FILE" ]] && { 
-    echo -e "\n=== 详细错误日志 ==="
-    cat "$LOG_FILE"
+    echo -e "\n=== 错误日志 (最后50行) ==="
+    tail -n 50 "$LOG_FILE"
     echo "====================="
 } || echo -e "\n无错误日志"
 
