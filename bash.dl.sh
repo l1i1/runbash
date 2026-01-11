@@ -104,8 +104,6 @@ run_request() {
 
 # 主测试逻辑
 echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
-echo "URL: $URL"
-echo "注意: 此模式使用 Curl 内存传输，测试的是真实网络带宽。"
 echo "=================================================="
 
 for ((i=1; i<=NUMBER; i++)); do
