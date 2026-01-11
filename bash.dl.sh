@@ -46,7 +46,7 @@ trap 'TRAP_TRIGGERED=1; cleanup' SIGINT SIGTERM
 # 计数函数
 increment_counter() {
     (
-        flock -x -w 5 200 || { echo "[$(date +%F\ %T)] 锁超时: $1" >> "$LOG_FILE"; return 1; }
+        flock -x -w 5 200 || { echo "[$(date '+%F %T')] 锁超时: $1" >> "$LOG_FILE"; return 1; }
         current=$(cat "$1" 2>/dev/null || echo 0)
         current=${current//[^0-9]/}
         echo $(( ${current:-0} + 1 )) > "$1"
@@ -58,7 +58,7 @@ add_bytes() {
     local bytes_to_add=${2//[^0-9]/}
     bytes_to_add=${bytes_to_add:-0}
     (
-        flock -x -w 5 200 || { echo "[$(date +%F\ %T)] 锁超时: $1" >> "$LOG_FILE"; return 1; }
+        flock -x -w 5 200 || { echo "[$(date '+%F %T')] 锁超时: $1" >> "$LOG_FILE"; return 1; }
         current=$(cat "$1" 2>/dev/null || echo 0)
         current=${current//[^0-9]/}
         echo $(( ${current:-0} + bytes_to_add )) > "$1"
@@ -105,7 +105,9 @@ while (( total_initiated < NUMBER )); do
             percentage=$((total_initiated * 100 / NUMBER))
             if (( percentage > prev_percentage + 4 )); then
                 current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
-                echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: $(awk "BEGIN {printf \"%.2f\", $current_bytes/1024/1024})MB"
+                current_mb=$((current_bytes / 1024 / 1024))
+                current_mb_frac=$(awk "BEGIN {printf \"%.2f\", $current_bytes / 1024 / 1024}")
+                echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: ${current_mb_frac}MB"
                 prev_percentage=$percentage
             fi
         fi
@@ -122,24 +124,27 @@ total_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
 end_time=$(date +%s)
 total_seconds=$((end_time - start_time))
 failed=$((NUMBER - final_completed))
-success_rate=$(awk "BEGIN {printf \"%.2f\", $final_completed / $NUMBER * 100}")
-qps=$(awk "BEGIN {printf \"%.2f\", $final_completed / (${total_seconds:-1})}")
-avg_bandwidth=$(awk "BEGIN {printf \"%.2f\", $total_bytes / (${total_seconds:-1}) / 1024 / 1024}")
 avg_bytes=$(( final_completed > 0 ? total_bytes / final_completed : 0 ))
+
+# 计算格式化值（避免嵌套引号问题）
+calc_success_rate=$(awk "BEGIN {printf \"%.2f\", $final_completed * 100 / $NUMBER}")
+calc_qps=$(awk "BEGIN {printf \"%.2f\", $final_completed / ${total_seconds:-1}}")
+calc_bandwidth=$(awk "BEGIN {printf \"%.2f\", $total_bytes / ${total_seconds:-1} / 1024 / 1024}")
+calc_total_mb=$(awk "BEGIN {printf \"%.2f\", $total_bytes / 1024 / 1024}")
 
 # 输出结果
 echo -e "\n==================== 测试完成 ===================="
 echo "总请求数:   $NUMBER"
 echo "成功请求:   $final_completed"
 echo "失败请求:   $failed"
-echo "成功率:     ${success_rate}%"
+echo "成功率:     ${calc_success_rate}%"
 echo "---------------------------------------------------"
-echo "总流量:     $(awk "BEGIN {printf \"%.2f\", $total_bytes/1024/1024})MB"
+echo "总流量:     ${calc_total_mb}MB"
 echo "平均流量/请求: $avg_bytes 字节"
-echo "带宽:       ${avg_bandwidth} MB/s"
+echo "带宽:       ${calc_bandwidth} MB/s"
 echo "---------------------------------------------------"
 echo "总耗时:     ${total_seconds}秒"
-echo "平均QPS:    ${qps}次/秒"
+echo "平均QPS:    ${calc_qps}次/秒"
 echo "=================================================="
 
 [[ -s "$LOG_FILE" ]] && { echo -e "\n错误日志最后20行:"; tail -n 20 "$LOG_FILE"; } || echo -e "\n无错误发生"
