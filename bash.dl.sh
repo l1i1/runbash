@@ -3,6 +3,29 @@
 set -o nounset  # 未定义变量报错
 set -o pipefail # 管道中任意命令失败则整体失败
 
+# ==============================================================================
+# ===================== 用户配置区 (根据需要修改) =====================
+# ==============================================================================
+
+# --- 测试参数 ---
+NUMBER=32                   # 总请求次数
+MAX_CONCURRENT=16              # 最大并发数 (建议根据CPU核心数调整)
+URL="https://fc.myzwq.cn/aHIweGpkdTB2cXI/MUpxdlJHMVRnbmdjdWd1MUpxdlJHL1g0MDowNDczMjM6MGd6Zw/HotPE-V2.8.251018.exe?token=MjAwNjk2&expiry=1768176000&fileName=HotPE-V2.8.251018.exe"  # 测试目标URL
+
+# --- 网络参数 ---
+RETRY_COUNT=1                  # curl 失败重试次数
+RETRY_DELAY=1                  # curl 失败重试间隔(秒)
+CONNECT_TIMEOUT=10             # 连接超时时间(秒)
+MAX_TIME=30                    # 单个请求最大允许时间(秒)
+
+# --- 路径配置 ---
+# 自定义临时文件目录 (留空则自动优先使用 /dev/shm，其次 /tmp)
+CUSTOM_TEMP_DIR=""              # 例如: "/tmp" 或 "/home/user/tmp"
+
+# ==============================================================================
+# ===================== 配置区结束 (下方为脚本逻辑) =====================
+# ==============================================================================
+
 # ===================== 前置检查 =====================
 # 1. 检查 Bash 版本（要求 4.3+，支持 wait -n）
 if [[ "${BASH_VERSINFO[0]}" -lt 4 || ("${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -lt 3) ]]; then
@@ -17,18 +40,15 @@ if ! command -v curl &> /dev/null; then
     exit 1
 fi
 
-# 3. 检查 curl 版本（--retry-all-errors 需要 7.71.0+，修复 echo -e 兼容性）
+# 3. 检查 curl 版本（--retry-all-errors 需要 7.71.0+）
 CURL_MIN_VERSION="7.71.0"
 CURL_VERSION=$(curl --version | head -n1 | awk '{print $2}')
 version_compare() {
     local v1=$1 v2=$2
-    # 修复：用 printf 替代 echo -e，提升兼容性
     [[ "$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -n1)" == "$v2" ]]
 }
 
 # 初始化 curl 重试参数（兼容低版本）
-RETRY_COUNT=1
-RETRY_DELAY=1
 if ! version_compare "$CURL_VERSION" "$CURL_MIN_VERSION"; then
     echo "警告: curl 版本低于 7.71.0，--retry-all-errors 不可用，仅重试网络连接错误"
     CURL_RETRY_ARGS="--retry $RETRY_COUNT --retry-delay $RETRY_DELAY"
@@ -107,25 +127,27 @@ get_remote_host_ip() {
     fi
 }
 
-# ===================== 核心配置 =====================
-NUMBER=32               # 总请求次数
-MAX_CONCURRENT=16          # 最大并发数
-URL="https://tf.sysri.cn/HotPE/Releases/HotPE-V2.8.251018.exe"  # 测试URL
+# ===================== 初始化环境变量 =====================
+SCRIPT_PID=$$
+
+# 临时文件配置（内存文件优先，保证唯一性）
+if [[ -n "$CUSTOM_TEMP_DIR" && -d "$CUSTOM_TEMP_DIR" && -w "$CUSTOM_TEMP_DIR" ]]; then
+    TEMP_DIR="$CUSTOM_TEMP_DIR"
+else
+    TEMP_DIR="/dev/shm"
+    [[ ! -w "$TEMP_DIR" ]] && TEMP_DIR="/tmp"  # 内存目录不可写则降级到/tmp
+fi
+
+LOG_FILE="download_${SCRIPT_PID}.log"    # 错误日志文件
+TEMP_COUNT="${TEMP_DIR}/curl_test_count_${SCRIPT_PID}"  # 成功计数文件
+TEMP_BYTES="${TEMP_DIR}/curl_test_bytes_${SCRIPT_PID}"  # 流量统计文件
 
 # 获取IP信息
 LOCAL_IP=$(get_local_ip)
 REMOTE_PUBLIC_IP=$(get_remote_ip)
 REMOTE_HOST_IP=$(get_remote_host_ip "$URL")
 
-# 临时文件配置（内存文件优先，保证唯一性）
-SCRIPT_PID=$$
-LOG_FILE="download_${SCRIPT_PID}.log"    # 错误日志文件
-TEMP_DIR="/dev/shm"
-[[ ! -w "$TEMP_DIR" ]] && TEMP_DIR="/tmp"  # 内存目录不可写则降级到/tmp
-TEMP_COUNT="${TEMP_DIR}/curl_test_count_${SCRIPT_PID}"  # 成功计数文件
-TEMP_BYTES="${TEMP_DIR}/curl_test_bytes_${SCRIPT_PID}"  # 流量统计文件
-
-# ===================== 全局变量 =====================
+# ===================== 全局状态变量 =====================
 start_time=$(date +%s)
 prev_percentage=0
 total_initiated=0         # 已发起请求数
@@ -169,7 +191,7 @@ increment_counter() {
     ) 200>"${count_file}.lock" 2>/dev/null || true
 }
 
-# 3. 安全累加流量函数（修复锁文件路径关键Bug）
+# 3. 安全累加流量函数
 add_bytes() {
     local bytes_file="$1"
     local bytes_to_add="$2"
@@ -179,14 +201,13 @@ add_bytes() {
     bytes_to_add=${bytes_to_add:-0}
     
     (
-        # 🔴 核心修复：锁文件路径改为 bytes_file.lock（而非 bytes_to_add.lock）
         flock -x -w 5 200 || { echo "[$(date +%F\ %T)] 锁文件超时: $bytes_file" >> "$LOG_FILE"; return 1; }
         # 读取当前值并清洗
         current=$(cat "$bytes_file" 2>/dev/null || echo 0)
         current=$(echo "$current" | tr -cd '0-9')
         # 安全累加
         echo $(( ${current:-0} + bytes_to_add )) > "$bytes_file"
-    ) 200>"${bytes_file}.lock" 2>/dev/null || true  # ✅ 修复后的正确路径
+    ) 200>"${bytes_file}.lock" 2>/dev/null || true
 }
 
 # 4. 格式化流量显示（健壮性增强）
@@ -221,14 +242,14 @@ calc_percent() {
     awk "BEGIN {printf \"%.2f\", $numerator / $denominator * 100}"
 }
 
-# 6. 单个请求执行函数（稳定+重试）
+# 6. 单个请求执行函数（使用配置区参数）
 run_request() {
     local url=$1
     local output_info downloaded_bytes http_code
 
-    # 执行curl请求（仅重试网络错误）
+    # 执行curl请求（使用配置的 TIMEOUT 和 RETRY 参数）
     output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
-                  --max-time 30 --connect-timeout 10 \
+                  --max-time $MAX_TIME --connect-timeout $CONNECT_TIMEOUT \
                   $CURL_RETRY_ARGS \
                   "$url" 2>> "$LOG_FILE")
 
@@ -257,7 +278,7 @@ wait_for_completion() {
     fi
 }
 
-# ===================== 初始化 =====================
+# ===================== 初始化文件 =====================
 # 所有文件操作添加容错，避免失败终止脚本
 > "$LOG_FILE" 2>/dev/null || true
 echo 0 > "$TEMP_COUNT" 2>/dev/null || true
