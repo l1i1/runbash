@@ -32,7 +32,7 @@ running_jobs=0
 CLEANUP_CALLED=0
 TRAP_TRIGGERED=0
 
-# 获取远程服务器IP（目标URL解析后的IP）
+# 获取远程服务器IP
 get_remote_ip() {
     local ip=""
     ip=$(curl -o /dev/null -s -w '%{remote_ip}' \
@@ -41,10 +41,9 @@ get_remote_ip() {
     echo "${ip:-未知}"
 }
 
-# 获取本机出口IP（公网IP）
+# 获取本机出口IP
 get_local_ip() {
     local ip=""
-    # 优先尝试 ifconfig.me，失败可换成 icanhazip.com 等服务
     ip=$(curl -s -4 --max-time 5 ifconfig.me 2>> "$LOG_FILE")
     echo "${ip:-未知}"
 }
@@ -85,14 +84,42 @@ add_bytes() {
     ) 200>"$1.lock" 2>/dev/null || true
 }
 
-# 请求执行
+# 请求执行（修复了错误日志记录）
 run_request() {
-    local output_info downloaded_bytes http_code
+    local output_info downloaded_bytes http_code curl_error
+    local temp_error_file="${TEMP_DIR}/curl_error_${SCRIPT_PID}_$$_$RANDOM.tmp"
+    
+    # 创建临时错误文件
+    : > "$temp_error_file"
+    
+    # 执行curl请求，将错误输出到临时文件
     output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
                   --max-time 30 --connect-timeout 10 \
                   --retry 1 --retry-delay 1 \
-                  "$1" 2>> "$LOG_FILE")
+                  "$1" 2> "$temp_error_file")
+    
+    # 读取错误信息
+    curl_error=$(cat "$temp_error_file" 2>/dev/null)
+    
+    # 如果有错误，记录到日志
+    if [[ -n "$curl_error" ]]; then
+        echo "[$(date '+%F %T')] URL: $1 - 错误: $curl_error" >> "$LOG_FILE"
+    fi
+    
+    # 清理临时文件
+    rm -f "$temp_error_file" 2>/dev/null
+    
+    # 解析输出
     IFS=$'\n' read -r downloaded_bytes http_code <<< "$output_info"
+    
+    # 记录HTTP状态码
+    if [[ -z "$http_code" ]]; then
+        echo "[$(date '+%F %T')] URL: $1 - 无HTTP状态码返回" >> "$LOG_FILE"
+    else
+        echo "[$(date '+%F %T')] URL: $1 - HTTP状态码: $http_code" >> "$LOG_FILE"
+    fi
+    
+    # 只有2xx和3xx状态码才算成功
     [[ "$http_code" =~ ^[23][0-9]{2}$ ]] && { increment_counter "$TEMP_COUNT"; add_bytes "$TEMP_BYTES" "$downloaded_bytes"; }
 }
 
@@ -108,6 +135,17 @@ wait_for_completion() {
 echo 0 > "$TEMP_COUNT" 2>/dev/null || true
 echo 0 > "$TEMP_BYTES" 2>/dev/null || true
 
+# 添加单个请求测试，用于诊断
+echo "开始单次请求测试..."
+single_test_result=$(curl -o /dev/null -s -w 'HTTP状态码: %{http_code}\n下载大小: %{size_download}字节\n错误信息: %{errormsg}\n' \
+                     --max-time 30 --connect-timeout 10 \
+                     "$URL" 2>&1)
+echo "单次测试结果:"
+echo "$single_test_result"
+echo "$single_test_result" >> "$LOG_FILE"
+echo "单次测试完成"
+echo "=================================================="
+
 # 主循环
 echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT"
 echo "URL:        $URL"
@@ -122,16 +160,12 @@ while (( total_initiated < NUMBER )); do
         ((running_jobs++))
         run_request "$URL" &
         
-        if (( total_initiated % 100 == 0 )); then
+        if (( total_initiated % 10 == 0 )); then  # 减少输出频率以便观察
             completed=$(cat "$TEMP_COUNT" 2>/dev/null || echo 0)
             percentage=$((total_initiated * 100 / NUMBER))
-            if (( percentage > prev_percentage + 4 )); then
-                current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
-                current_mb=$((current_bytes / 1024 / 1024))
-                current_mb_frac=$(awk "BEGIN {printf \"%.2f\", $current_bytes / 1024 / 1024}")
-                echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: ${current_mb_frac}MB | 远程IP: $REMOTE_IP | 本地IP: $LOCAL_IP"
-                prev_percentage=$percentage
-            fi
+            current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
+            current_mb_frac=$(awk "BEGIN {printf \"%.2f\", $current_bytes / 1024 / 1024}")
+            echo "进度: $total_initiated/$NUMBER (${percentage}%) | 成功=$completed | 流量: ${current_mb_frac}MB | 远程IP: $REMOTE_IP | 本地IP: $LOCAL_IP"
         fi
     done
     wait_for_completion
@@ -148,7 +182,7 @@ total_seconds=$((end_time - start_time))
 failed=$((NUMBER - final_completed))
 avg_bytes=$(( final_completed > 0 ? total_bytes / final_completed : 0 ))
 
-# 计算格式化值（避免嵌套引号问题）
+# 计算格式化值
 calc_success_rate=$(awk "BEGIN {printf \"%.2f\", $final_completed * 100 / $NUMBER}")
 calc_qps=$(awk "BEGIN {printf \"%.2f\", $final_completed / ${total_seconds:-1}}")
 calc_bandwidth=$(awk "BEGIN {printf \"%.2f\", $total_bytes / ${total_seconds:-1} / 1024 / 1024}")
@@ -172,7 +206,12 @@ echo "总耗时:     ${total_seconds}秒"
 echo "平均QPS:    ${calc_qps}次/秒"
 echo "=================================================="
 
-[[ -s "$LOG_FILE" ]] && { echo -e "\n错误日志最后20行:"; tail -n 20 "$LOG_FILE"; } || echo -e "\n无错误发生"
+# 显示详细错误日志
+[[ -s "$LOG_FILE" ]] && { 
+    echo -e "\n=== 详细错误日志 ==="
+    cat "$LOG_FILE"
+    echo "====================="
+} || echo -e "\n无错误日志"
 
 cleanup
 echo -e "\n测试完成"
