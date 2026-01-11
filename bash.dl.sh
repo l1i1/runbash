@@ -43,7 +43,7 @@ cleanup() {
 
 trap 'TRAP_TRIGGERED=1; cleanup' SIGINT SIGTERM
 
-# 计数函数（修复空值处理 + 添加日志）
+# 计数函数
 increment_counter() {
     (
         flock -x -w 5 200 || { echo "[$(date +%F\ %T)] 锁超时: $1" >> "$LOG_FILE"; return 1; }
@@ -53,7 +53,7 @@ increment_counter() {
     ) 200>"$1.lock" 2>/dev/null || true
 }
 
-# 流量统计（修复空值处理 + 添加日志）
+# 流量统计
 add_bytes() {
     local bytes_to_add=${2//[^0-9]/}
     bytes_to_add=${bytes_to_add:-0}
@@ -96,7 +96,8 @@ echo "=================================================="
 
 while (( total_initiated < NUMBER )); do
     while (( running_jobs < MAX_CONCURRENT && total_initiated < NUMBER )); do
-        ((total_initiated++)) ((running_jobs++))
+        ((total_initiated++))
+        ((running_jobs++))
         run_request "$URL" &
         
         if (( total_initiated % 100 == 0 )); then
