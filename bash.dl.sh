@@ -10,9 +10,10 @@ set -o pipefail # 管道中任意命令失败则整体失败
 # --- 测试参数 ---
 NUMBER=32                   # 总请求次数
 MAX_CONCURRENT=16              # 最大并发数 (建议根据CPU核心数调整)
-URL="https://fc.myzwq.cn/aHIweGpkdTB2cXI/MUpxdlJHMVRnbmdjdWd1MUpxdlJHL1g0MDowNDczMjM6MGd6Zw/HotPE-V2.8.251018.exe?token=MjAwNjk2&expiry=1768176000&fileName=HotPE-V2.8.251018.exe"  # 测试目标URL
+URL="https://tf.sysri.cn/HotPE/Releases/HotPE-V2.8.251018.exe"  # 测试目标URL
 
 # --- 网络参数 ---
+FOLLOW_REDIRECTS="yes"         # 是否跟随 302/301 跳转 (yes/no，建议 yes 以便下载真实文件测试带宽)
 RETRY_COUNT=1                  # curl 失败重试次数
 RETRY_DELAY=1                  # curl 失败重试间隔(秒)
 CONNECT_TIMEOUT=10             # 连接超时时间(秒)
@@ -54,6 +55,13 @@ if ! version_compare "$CURL_VERSION" "$CURL_MIN_VERSION"; then
     CURL_RETRY_ARGS="--retry $RETRY_COUNT --retry-delay $RETRY_DELAY"
 else
     CURL_RETRY_ARGS="--retry $RETRY_COUNT --retry-delay $RETRY_DELAY --retry-all-errors"
+fi
+
+# 处理 302 跳转参数
+if [[ "$FOLLOW_REDIRECTS" == "yes" ]]; then
+    CURL_REDIRECT_ARGS="-L"
+else
+    CURL_REDIRECT_ARGS=""
 fi
 
 # ===================== IP 获取函数 =====================
@@ -242,15 +250,20 @@ calc_percent() {
     awk "BEGIN {printf \"%.2f\", $numerator / $denominator * 100}"
 }
 
-# 6. 单个请求执行函数（使用配置区参数）
+# 6. 单个请求执行函数（使用配置区参数，支持302）
 run_request() {
     local url=$1
     local output_info downloaded_bytes http_code
 
-    # 执行curl请求（使用配置的 TIMEOUT 和 RETRY 参数）
+    # 执行curl请求
+    # -L: 跟随重定向(支持302)
+    # -o /dev/null: 丢弃下载内容（我们只需要统计）
+    # -s: 静默模式
+    # -w: 输出格式（大小和HTTP码）
     output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
                   --max-time $MAX_TIME --connect-timeout $CONNECT_TIMEOUT \
                   $CURL_RETRY_ARGS \
+                  $CURL_REDIRECT_ARGS \
                   "$url" 2>> "$LOG_FILE")
 
     # 分割输出（兼容Bash 3.0+）
@@ -287,6 +300,7 @@ echo 0 > "$TEMP_BYTES" 2>/dev/null || true
 # ===================== 主测试逻辑 =====================
 echo "开始并发测试: 总次数=$NUMBER, 最大并发=$MAX_CONCURRENT, 重试次数=$RETRY_COUNT"
 echo "URL: $URL"
+echo "跟随跳转: $FOLLOW_REDIRECTS"
 echo "临时文件目录: $TEMP_DIR"
 echo "=================================================="
 echo "网络配置信息:"
@@ -358,6 +372,7 @@ echo "---------------------------------------------------"
 echo "测试配置:"
 echo "  总请求数:         $NUMBER"
 echo "  最大并发数:       $MAX_CONCURRENT"
+echo "  跟随302跳转:      $FOLLOW_REDIRECTS"
 echo "  成功请求数:       $final_completed"
 echo "  失败请求数:       $failed"
 echo "  成功率:           ${success_rate}%"
