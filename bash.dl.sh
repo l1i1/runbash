@@ -84,35 +84,44 @@ add_bytes() {
     ) 200>"$1.lock" 2>/dev/null || true
 }
 
-# 请求执行（修复了错误日志记录）
+# 请求执行（使用临时文件代替命令替换）
 run_request() {
-    local output_info downloaded_bytes http_code curl_error
+    local temp_output_file="${TEMP_DIR}/curl_output_${SCRIPT_PID}_$$_$RANDOM.tmp"
     local temp_error_file="${TEMP_DIR}/curl_error_${SCRIPT_PID}_$$_$RANDOM.tmp"
+    local downloaded_bytes http_code curl_error
     
-    # 创建临时错误文件
+    # 创建临时文件
+    : > "$temp_output_file"
     : > "$temp_error_file"
     
-    # 执行curl请求，将错误输出到临时文件
-    output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
-                  --max-time 30 --connect-timeout 10 \
-                  --retry 1 --retry-delay 1 \
-                  "$1" 2> "$temp_error_file")
+    # 执行curl请求，输出到临时文件
+    curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
+         --max-time 30 --connect-timeout 10 \
+         --retry 1 --retry-delay 1 \
+         "$1" > "$temp_output_file" 2> "$temp_error_file"
     
-    # 读取错误信息
+    # 读取输出和错误
     curl_error=$(cat "$temp_error_file" 2>/dev/null)
+    output_content=$(cat "$temp_output_file" 2>/dev/null)
     
     # 如果有错误，记录到日志
     if [[ -n "$curl_error" ]]; then
-        echo "[$(date '+%F %T')] URL: $1 - 错误: $curl_error" >> "$LOG_FILE"
+        echo "[$(date '+%F %T')] URL: $1 - curl错误: $curl_error" >> "$LOG_FILE"
     fi
     
     # 清理临时文件
-    rm -f "$temp_error_file" 2>/dev/null
+    rm -f "$temp_output_file" "$temp_error_file" 2>/dev/null
     
     # 解析输出
-    IFS=$'\n' read -r downloaded_bytes http_code <<< "$output_info"
+    echo "$output_content" | while IFS= read -r line; do
+        if [[ -z "$downloaded_bytes" ]]; then
+            downloaded_bytes="$line"
+        else
+            http_code="$line"
+        fi
+    done
     
-    # 记录HTTP状态码
+    # 验证HTTP状态码
     if [[ -z "$http_code" ]]; then
         echo "[$(date '+%F %T')] URL: $1 - 无HTTP状态码返回" >> "$LOG_FILE"
     else
@@ -120,7 +129,10 @@ run_request() {
     fi
     
     # 只有2xx和3xx状态码才算成功
-    [[ "$http_code" =~ ^[23][0-9]{2}$ ]] && { increment_counter "$TEMP_COUNT"; add_bytes "$TEMP_BYTES" "$downloaded_bytes"; }
+    if [[ "$http_code" =~ ^[23][0-9]{2}$ ]]; then
+        increment_counter "$TEMP_COUNT"
+        add_bytes "$TEMP_BYTES" "${downloaded_bytes:-0}"
+    fi
 }
 
 # 并发控制
@@ -160,7 +172,7 @@ while (( total_initiated < NUMBER )); do
         ((running_jobs++))
         run_request "$URL" &
         
-        if (( total_initiated % 10 == 0 )); then  # 减少输出频率以便观察
+        if (( total_initiated % 10 == 0 )); then
             completed=$(cat "$TEMP_COUNT" 2>/dev/null || echo 0)
             percentage=$((total_initiated * 100 / NUMBER))
             current_bytes=$(cat "$TEMP_BYTES" 2>/dev/null || echo 0)
