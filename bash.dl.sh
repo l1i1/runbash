@@ -110,7 +110,7 @@ get_remote_host_ip() {
 # ===================== 核心配置 =====================
 NUMBER=32               # 总请求次数
 MAX_CONCURRENT=16          # 最大并发数
-URL="https://sc.sysri.cn/_def/other/test/IMG20251108113913.jpg?origpic"  # 测试URL
+URL="https://tf.sysri.cn/HotPE/Releases/HotPE-V2.8.251018.exe"  # 测试URL
 
 # 获取IP信息
 LOCAL_IP=$(get_local_ip)
