@@ -14,4 +14,4 @@ jobs:
 
       - name: run bash
         run: |
-          sudo bash ./bash.dl.sh
+          sudo bash ./bash.dl.mini.sh
