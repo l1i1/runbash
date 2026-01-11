@@ -16,7 +16,7 @@ fi
 # 初始化
 NUMBER=32
 MAX_CONCURRENT=32
-URL="https://sc.sysri.cn/_def/i/p/1/686d259fb565d.png"
+URL="https://github.com/OpenListTeam/OpenList/releases/download/v4.1.9/openlist-android-arm.tar.gz"
 SCRIPT_PID=$$
 LOG_FILE="download_${SCRIPT_PID}.log"
 TEMP_DIR="/dev/shm"
