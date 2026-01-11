@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ================== 用户配置 ==================
-N=32                       # 总请求数
-CONC=16                     # 并发数
+N=32                         # 总请求数
+CONC=16                       # 并发数
 URL="https://tf.sysri.cn/HotPE/Releases/HotPE-V2.8.251018.exe"
-FOLLOW="yes"                # 跟随302跳转
-C_TO=10; M_TO=30            # 连接/总超时(秒)
+FOLLOW="yes"                  # 跟随302跳转
+C_TO=10; M_TO=30              # 连接/总超时(秒)
 
 # ================== 初始化 ==================
 [[ ${BASH_VERSINFO[0]} -lt 4 || (${BASH_VERSINFO[0]} -eq 4 && ${BASH_VERSINFO[1]} -lt 3) ]] && { echo "需 Bash 4.3+"; exit 1; }
@@ -45,7 +45,8 @@ while((K<N)); do
     done
     ((R>=CONC)) && { wait -n 2>/dev/null || true; ((R--)); }
 done
-wait
+# ✅ 修复点：忽略后台任务的错误退出码，防止 set -e 终止脚本
+wait || true
 
 # ================== 结果输出 ==================
 DT=$(($(date +%s)-T)); OK=$(<$C); BY=$(<$B); FL=$((N-OK))
