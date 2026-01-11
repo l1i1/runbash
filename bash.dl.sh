@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# URL 并发测试脚本（使用 Curl 无 I/O 瓶颈版 - 终极修复版）
+# URL 并发测试脚本（使用 Curl 无 I/O 瓶颈版 - 消除 Broken Pipe 错误）
 # 核心配置
-NUMBER=32000                # 总请求次数
-MAX_CONCURRENT=16          # 最大并发数
+NUMBER=320000               # 总请求次数 (你已修改为 32000)
+MAX_CONCURRENT=32          # 最大并发数
 URL="https://www.8uid.com/wp-content/uploads/2024/06/20240630005115267-%E9%9A%90%E7%A7%81%E6%94%BF%E7%AD%96.png"  # 测试URL
 
 LOG_FILE="download.log"    # 错误日志文件
@@ -30,7 +30,6 @@ increment_counter() {
     local count_file="$1"
     (
         flock -x 200
-        # 读取当前值，如果文件为空则默认为0
         current=$(cat "$count_file" 2>/dev/null || echo 0)
         echo $((current + 1)) > "$count_file"
     ) 200>"${count_file}.lock"
@@ -40,8 +39,6 @@ increment_counter() {
 add_bytes() {
     local bytes_file="$1"
     local bytes_to_add="$2"
-    
-    # 数据清洗：确保只保留数字
     bytes_to_add=${bytes_to_add//[^0-9]/}
     
     (
@@ -52,18 +49,15 @@ add_bytes() {
     ) 200>"${bytes_file}.lock"
 }
 
-# 格式化流量显示 (修复浮点数逻辑)
+# 格式化流量显示
 format_bytes() {
     local bytes=$1
     local units=('B' 'KB' 'MB' 'GB' 'TB')
     local unit=0
     local display_val=$bytes
     
-    # 使用整数进行循环判断，避免 (( )) 中出现浮点数
     while (( bytes >= 1024 && unit < ${#units[@]} - 1 )); do
-        # 计算显示用的浮点数值
         display_val=$(awk "BEGIN {printf \"%.2f\", $bytes / 1024}")
-        # 更新 bytes 用于下一次整数判断
         bytes=$((bytes / 1024))
         ((unit++))
     done
@@ -71,30 +65,21 @@ format_bytes() {
     echo "${display_val} ${units[$unit]}"
 }
 
-# 单个请求执行函数 (使用 Curl)
+# 单个请求执行函数 (优化版：消除 Broken Pipe)
 run_request() {
     local url=$1
     local output_info
-    local http_code
     local downloaded_bytes
+    local http_code
 
-    # curl 参数说明:
-    # -o /dev/null    : 丢弃内容，不写磁盘，消除I/O瓶颈
-    # -s              : 静默模式
-    # -w              : 输出格式
-    # --max-time 30   : 整个请求超时时间
-    # --connect-timeout 10 : 连接超时时间
-    
     output_info=$(curl -o /dev/null -s -w '%{size_download}\n%{http_code}' \
                   --max-time 30 --connect-timeout 10 "$url" 2>> "$LOG_FILE")
 
-    # 解析输出
-    downloaded_bytes=$(echo "$output_info" | head -n1)
-    http_code=$(echo "$output_info" | tail -n1)
+    # *** 核心修复：使用 Bash 原生 read 命令分割换行符 ***
+    # 这样完全避免了使用管道 (|) 和 head/tail，消除 Broken Pipe 错误，且速度更快
+    IFS=$'\n' read -r downloaded_bytes http_code <<< "$output_info"
 
-    # 判断逻辑: 
-    # 1. http_code 必须是数字 (防止 curl 输出异常文本)
-    # 2. 状态码 200-399 视为成功
+    # 判断逻辑
     if [[ "$http_code" =~ ^[0-9]+$ ]] && (( http_code >= 200 && http_code < 400 )); then
         increment_counter "$TEMP_COUNT"
         add_bytes "$TEMP_BYTES" "$downloaded_bytes"
@@ -110,14 +95,13 @@ for ((i=1; i<=NUMBER; i++)); do
     # 启动后台请求
     run_request "$URL" &
     
-    # 控制并发数 (等待任意一个后台任务结束)
+    # 控制并发数
     while (( $(jobs -r | wc -l) >= MAX_CONCURRENT )); do
         wait -n 2>/dev/null || true
     done
 
-    # 显示进度 (每100次或每增加5%显示一次)
+    # 显示进度
     completed=$(cat "$TEMP_COUNT")
-    # 防止除以0
     if (( NUMBER > 0 )); then
         percentage=$((completed * 100 / NUMBER))
     else
@@ -139,7 +123,6 @@ wait
 
 # 读取最终完成数和总流量
 final_completed=$(cat "$TEMP_COUNT")
-# *** 已修复：此处去掉了多余的右括号 ***
 total_bytes=$(cat "$TEMP_BYTES")
 
 # 计算结束时间和总耗时
