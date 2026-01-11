@@ -14,7 +14,7 @@ if ! command -v curl &> /dev/null; then
 fi
 
 # 初始化
-NUMBER=320000
+NUMBER=32
 MAX_CONCURRENT=32
 URL="https://www.8uid.com/wp-content/uploads/2024/06/20240630005115267-%E9%9A%90%E7%A7%81%E6%94%BF%E7%AD%96.png"
 SCRIPT_PID=$$
