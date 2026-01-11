@@ -84,11 +84,11 @@ add_bytes() {
     ) 200>"$1.lock" 2>/dev/null || true
 }
 
-# 请求执行（使用临时文件代替命令替换）
+# 请求执行（修复变量作用域问题）
 run_request() {
     local temp_output_file="${TEMP_DIR}/curl_output_${SCRIPT_PID}_$$_$RANDOM.tmp"
     local temp_error_file="${TEMP_DIR}/curl_error_${SCRIPT_PID}_$$_$RANDOM.tmp"
-    local downloaded_bytes http_code curl_error
+    local downloaded_bytes="" http_code="" curl_error line_count=0
     
     # 创建临时文件
     : > "$temp_output_file"
@@ -100,26 +100,26 @@ run_request() {
          --retry 1 --retry-delay 1 \
          "$1" > "$temp_output_file" 2> "$temp_error_file"
     
-    # 读取输出和错误
+    # 读取错误信息
     curl_error=$(cat "$temp_error_file" 2>/dev/null)
-    output_content=$(cat "$temp_output_file" 2>/dev/null)
     
     # 如果有错误，记录到日志
     if [[ -n "$curl_error" ]]; then
         echo "[$(date '+%F %T')] URL: $1 - curl错误: $curl_error" >> "$LOG_FILE"
     fi
     
-    # 清理临时文件
-    rm -f "$temp_output_file" "$temp_error_file" 2>/dev/null
-    
-    # 解析输出
-    echo "$output_content" | while IFS= read -r line; do
-        if [[ -z "$downloaded_bytes" ]]; then
+    # 直接读取文件内容并解析（避免管道子shell问题）
+    while IFS= read -r line; do
+        if [[ $line_count -eq 0 ]]; then
             downloaded_bytes="$line"
-        else
+        elif [[ $line_count -eq 1 ]]; then
             http_code="$line"
         fi
-    done
+        ((line_count++))
+    done < "$temp_output_file"
+    
+    # 清理临时文件
+    rm -f "$temp_output_file" "$temp_error_file" 2>/dev/null
     
     # 验证HTTP状态码
     if [[ -z "$http_code" ]]; then
