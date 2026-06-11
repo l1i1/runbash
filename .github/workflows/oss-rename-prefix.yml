@@ -1,0 +1,164 @@
+name: OSS Rename Prefix
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_prefix:
+        description: "Source OSS prefix"
+        required: false
+        default: "HotPan/"
+      target_prefix:
+        description: "Target OSS prefix"
+        required: false
+        default: "hotfile-hf/"
+      concurrency:
+        description: "Concurrent OSS copy/delete operations"
+        required: false
+        default: "16"
+      delete_source:
+        description: "Delete source after successful copy"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      OSS_ENDPOINT: oss-cn-hongkong.aliyuncs.com
+      OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+      SOURCE_PREFIX: ${{ inputs.source_prefix }}
+      TARGET_PREFIX: ${{ inputs.target_prefix }}
+      CONCURRENCY: ${{ inputs.concurrency }}
+      DELETE_SOURCE: ${{ inputs.delete_source }}
+    steps:
+      - name: Rename OSS prefix by server-side copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > rename.mjs <<'NODE'
+          import crypto from 'node:crypto';
+          import { setTimeout as sleep } from 'node:timers/promises';
+
+          const cfg = {
+            endpoint: must('OSS_ENDPOINT'),
+            bucket: must('OSS_BUCKET'),
+            accessKeyId: must('OSS_ACCESS_KEY_ID'),
+            accessKeySecret: must('OSS_ACCESS_KEY_SECRET'),
+            sourcePrefix: must('SOURCE_PREFIX'),
+            targetPrefix: must('TARGET_PREFIX'),
+            concurrency: Number(process.env.CONCURRENCY || 16),
+            deleteSource: (process.env.DELETE_SOURCE || 'true') === 'true',
+          };
+          function must(name) { const v = process.env[name]; if (!v) throw new Error('Missing env ' + name); return v; }
+          const xmlDecode = s => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+          const ossEncode = s => encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+          const ossPath = key => '/' + key.split('/').map(ossEncode).join('/');
+          const canonicalHeaders = headers => Object.entries(headers)
+            .filter(([k]) => k.toLowerCase().startsWith('x-oss-'))
+            .map(([k, v]) => [k.toLowerCase(), String(v).trim()])
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([k, v]) => k + ':' + v + '\n')
+            .join('');
+          function sign(method, resource, headers = {}, contentType = '', contentMd5 = '') {
+            const date = new Date().toUTCString();
+            headers.Date = date;
+            const stringToSign = [method, contentMd5, contentType, date, canonicalHeaders(headers) + resource].join('\n');
+            const sig = crypto.createHmac('sha1', cfg.accessKeySecret).update(stringToSign, 'utf8').digest('base64');
+            headers.Authorization = 'OSS ' + cfg.accessKeyId + ':' + sig;
+            return headers;
+          }
+          async function retry(name, fn, attempts = 10) {
+            let last;
+            for (let i = 1; i <= attempts; i++) {
+              try { return await fn(); } catch (e) {
+                last = e;
+                if (i === attempts) break;
+                const wait = Math.min(30000, 500 * 2 ** Math.min(i - 1, 6)) + Math.floor(Math.random() * 500);
+                console.warn('retry', i, name, e.message, 'waiting', wait + 'ms');
+                await sleep(wait);
+              }
+            }
+            throw last;
+          }
+          async function listPage(token) {
+            const params = new URLSearchParams({ 'list-type': '2', prefix: cfg.sourcePrefix, 'max-keys': '1000' });
+            if (token) params.set('continuation-token', token);
+            const url = 'https://' + cfg.bucket + '.' + cfg.endpoint + '/?' + params.toString();
+            const res = await fetch(url, { headers: sign('GET', '/' + cfg.bucket + '/') });
+            const text = await res.text();
+            if (!res.ok) throw new Error('LIST ' + cfg.sourcePrefix + ' -> ' + res.status + ' ' + text.slice(0, 500));
+            const keys = [...text.matchAll(/<Key>([\s\S]*?)<\/Key>/g)].map(m => xmlDecode(m[1]));
+            const truncated = /<IsTruncated>true<\/IsTruncated>/.test(text);
+            const next = (text.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/) || [])[1];
+            return { keys, next: next ? xmlDecode(next) : '', truncated };
+          }
+          async function collectKeys() {
+            const keys = [];
+            let token = '';
+            do {
+              const page = await retry('list page', () => listPage(token));
+              keys.push(...page.keys);
+              token = page.truncated ? page.next : '';
+              console.log('listed', keys.length, 'next', token ? 'yes' : 'no');
+            } while (token);
+            return keys.filter(k => k.startsWith(cfg.sourcePrefix) && k !== cfg.sourcePrefix);
+          }
+          async function head(key) {
+            const res = await fetch('https://' + cfg.bucket + '.' + cfg.endpoint + ossPath(key), { method: 'HEAD', headers: sign('HEAD', '/' + cfg.bucket + '/' + key) });
+            if (res.ok) return { ok: true, size: Number(res.headers.get('content-length') || -1) };
+            if (res.status === 404) return { ok: false, size: -1 };
+            throw new Error('HEAD ' + key + ' -> ' + res.status);
+          }
+          async function copyObject(sourceKey, targetKey) {
+            const source = '/' + cfg.bucket + ossPath(sourceKey);
+            const headers = { 'x-oss-copy-source': source };
+            const res = await fetch('https://' + cfg.bucket + '.' + cfg.endpoint + ossPath(targetKey), { method: 'PUT', headers: sign('PUT', '/' + cfg.bucket + '/' + targetKey, headers) });
+            const text = await res.text();
+            if (!res.ok) throw new Error('COPY ' + sourceKey + ' -> ' + targetKey + ' ' + res.status + ' ' + text.slice(0, 500));
+          }
+          async function deleteObject(key) {
+            const res = await fetch('https://' + cfg.bucket + '.' + cfg.endpoint + ossPath(key), { method: 'DELETE', headers: sign('DELETE', '/' + cfg.bucket + '/' + key) });
+            const text = await res.text();
+            if (!res.ok && res.status !== 404) throw new Error('DELETE ' + key + ' -> ' + res.status + ' ' + text.slice(0, 500));
+          }
+          function targetFor(sourceKey) { return cfg.targetPrefix + sourceKey.slice(cfg.sourcePrefix.length); }
+          async function runPool(items, limit, worker) {
+            let index = 0, done = 0;
+            const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+              while (index < items.length) {
+                const item = items[index++];
+                await worker(item);
+                done++;
+                if (done % 25 === 0 || done === items.length) console.log('renamed progress', done + '/' + items.length);
+              }
+            });
+            await Promise.all(workers);
+          }
+
+          console.log('config', JSON.stringify({ sourcePrefix: cfg.sourcePrefix, targetPrefix: cfg.targetPrefix, concurrency: cfg.concurrency, deleteSource: cfg.deleteSource }));
+          const keys = await collectKeys();
+          console.log('objects to rename', keys.length);
+          await runPool(keys, cfg.concurrency, async sourceKey => {
+            const targetKey = targetFor(sourceKey);
+            const src = await retry('head source ' + sourceKey, () => head(sourceKey));
+            const dst = await retry('head target ' + targetKey, () => head(targetKey));
+            if (!dst.ok || dst.size !== src.size) {
+              await retry('copy ' + sourceKey, () => copyObject(sourceKey, targetKey));
+            }
+            const dst2 = await retry('head target verify ' + targetKey, () => head(targetKey));
+            if (!dst2.ok || dst2.size !== src.size) throw new Error('copy verify failed ' + sourceKey + ' -> ' + targetKey);
+            if (cfg.deleteSource) await retry('delete ' + sourceKey, () => deleteObject(sourceKey));
+          });
+          console.log('rename complete');
+          NODE
+          node rename.mjs
