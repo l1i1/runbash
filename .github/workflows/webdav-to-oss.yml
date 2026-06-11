@@ -172,6 +172,10 @@ jobs:
           function targetKey(srcPath) {
             return srcPath.slice(cfg.webdavRoot.length).replace(/^\/+/, '');
           }
+          function shardOf(key) {
+            const h = crypto.createHash('sha1').update(key).digest();
+            return h.readUInt32BE(0) % cfg.shardTotal;
+          }
           async function ossRequest(method, key, query = '', headers = {}, body = undefined, contentType = '') {
             const signed = sign(method, key, query, headers, contentType);
             const url = 'https://' + cfg.bucket + '.' + cfg.endpoint + ossPath(key) + (query ? '?' + query : '');
