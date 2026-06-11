@@ -1,0 +1,106 @@
+name: WebDAV to OSS
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview without uploading"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      transfers:
+        description: "Parallel transfer count"
+        required: false
+        default: "16"
+      checkers:
+        description: "Parallel checker count"
+        required: false
+        default: "32"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webdav-to-oss
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install rclone
+        run: |
+          set -euo pipefail
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure remotes
+        shell: bash
+        env:
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+          OSS_REGION: ${{ secrets.OSS_REGION }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          WEBDAV_OBSCURED_PASS="$(rclone obscure "$WEBDAV_PASS")"
+          OSS_OBSCURED_SECRET="$(rclone obscure "$OSS_ACCESS_KEY_SECRET")"
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [webdavsrc]
+          type = webdav
+          url = $WEBDAV_URL
+          vendor = other
+          user = $WEBDAV_USER
+          pass = $WEBDAV_OBSCURED_PASS
+
+          [ossdst]
+          type = s3
+          provider = Alibaba
+          env_auth = false
+          access_key_id = $OSS_ACCESS_KEY_ID
+          secret_access_key = $OSS_OBSCURED_SECRET
+          endpoint = $OSS_ENDPOINT
+          region = $OSS_REGION
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Sync WebDAV directory contents to OSS bucket root
+        shell: bash
+        env:
+          WEBDAV_ROOT: ${{ secrets.WEBDAV_ROOT }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          TRANSFERS: ${{ inputs.transfers }}
+          CHECKERS: ${{ inputs.checkers }}
+        run: |
+          set -euo pipefail
+          flags=(
+            --fast-list
+            --transfers "$TRANSFERS"
+            --checkers "$CHECKERS"
+            --multi-thread-streams 8
+            --multi-thread-cutoff 64M
+            --s3-upload-concurrency 8
+            --s3-chunk-size 64M
+            --buffer-size 32M
+            --use-mmap
+            --retries 10
+            --low-level-retries 20
+            --stats 15s
+            --stats-one-line
+            --progress
+            --create-empty-src-dirs
+          )
+          if [[ "$DRY_RUN" == "true" ]]; then
+            flags+=(--dry-run)
+          fi
+          rclone sync "webdavsrc:$WEBDAV_ROOT" "ossdst:$OSS_BUCKET/" "${flags[@]}"
