@@ -6,15 +6,15 @@ on:
       file_concurrency:
         description: "How many files to process at once"
         required: false
-        default: "3"
+        default: "1"
       part_concurrency:
         description: "Multipart upload concurrency per large file"
         required: false
-        default: "8"
+        default: "4"
       part_size_mb:
         description: "Multipart part size in MB"
         required: false
-        default: "64"
+        default: "128"
       large_file_mb:
         description: "Use multipart when file is at least this MB"
         required: false
@@ -64,6 +64,7 @@ jobs:
       - name: Native WebDAV to OSS multipart upload
         shell: bash
         run: |
+          # 123pan account risk control: keep defaults conservative. Use more shards only after confirming the account is not rate-limited.
           set -euo pipefail
           cat > migrate.mjs <<'NODE'
           import crypto from 'node:crypto';
