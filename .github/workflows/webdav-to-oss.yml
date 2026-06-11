@@ -121,13 +121,14 @@ jobs:
             if (contentType) headers['Content-Type'] = contentType;
             return headers;
           }
-          async function retry(name, fn, attempts = 5) {
+          async function retry(name, fn, attempts = 20) {
             let last;
             for (let i = 1; i <= attempts; i++) {
               try { return await fn(); } catch (e) {
                 last = e;
                 if (i === attempts) break;
-                const wait = Math.min(30000, 1000 * 2 ** (i - 1));
+                const jitter = Math.floor(Math.random() * 1000);
+                const wait = Math.min(60000, 1000 * 2 ** Math.min(i - 1, 6)) + jitter;
                 console.warn('retry', i, name, e.message, 'waiting', wait + 'ms');
                 await sleep(wait);
               }
@@ -267,7 +268,7 @@ jobs:
             const sizeMb = (file.size / 1024 / 1024).toFixed(1);
             const started = Date.now();
             if (cfg.skipExisting) {
-              const head = await retry('HEAD ' + key, () => headObject(key), 2);
+              const head = await retry('HEAD ' + key, () => headObject(key), 4);
               if (head.exists === true && head.size === file.size) {
                 console.log('skip existing', key, sizeMb + 'MB');
                 return;
