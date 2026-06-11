@@ -3,22 +3,22 @@ name: WebDAV to OSS
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Preview without uploading"
+      file_concurrency:
+        description: "How many files to process at once"
         required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-      transfers:
-        description: "Parallel transfer count"
+        default: "3"
+      part_concurrency:
+        description: "Multipart upload concurrency per large file"
         required: false
-        default: "16"
-      checkers:
-        description: "Parallel checker count"
+        default: "8"
+      part_size_mb:
+        description: "Multipart part size in MB"
         required: false
-        default: "32"
+        default: "64"
+      large_file_mb:
+        description: "Use multipart when file is at least this MB"
+        required: false
+        default: "128"
 
 permissions:
   contents: read
@@ -28,85 +28,219 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
+  migrate:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+      WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+      WEBDAV_ROOT: ${{ secrets.WEBDAV_ROOT }}
+      OSS_ENDPOINT: oss-cn-hongkong.aliyuncs.com
+      OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+      FILE_CONCURRENCY: ${{ inputs.file_concurrency }}
+      PART_CONCURRENCY: ${{ inputs.part_concurrency }}
+      PART_SIZE_MB: ${{ inputs.part_size_mb }}
+      LARGE_FILE_MB: ${{ inputs.large_file_mb }}
     steps:
-      - name: Install rclone
-        run: |
-          set -euo pipefail
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          rclone version
-
-      - name: Configure remotes
+      - name: Native WebDAV to OSS multipart upload
         shell: bash
-        env:
-          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-          WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
-          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
-          OSS_REGION: ${{ secrets.OSS_REGION }}
-          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.config/rclone
-          WEBDAV_OBSCURED_PASS="$(rclone obscure "$WEBDAV_PASS")"
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [webdavsrc]
-          type = webdav
-          url = $WEBDAV_URL
-          vendor = other
-          user = $WEBDAV_USER
-          pass = $WEBDAV_OBSCURED_PASS
+          cat > migrate.mjs <<'NODE'
+          import crypto from 'node:crypto';
+          import { setTimeout as sleep } from 'node:timers/promises';
 
-          [ossdst]
-          type = s3
-          provider = Alibaba
-          env_auth = false
-          access_key_id = $OSS_ACCESS_KEY_ID
-          secret_access_key = $OSS_ACCESS_KEY_SECRET
-          # Use the OSS regional endpoint for S3 signing. OSS custom domain provided by user: vhbs.top
-          endpoint = $OSS_ENDPOINT
-          region = $OSS_REGION
-          acl = private
-          no_check_bucket = true
-          EOF
+          const cfg = {
+            webdavUrl: must('WEBDAV_URL').replace(/\/$/, ''),
+            webdavUser: must('WEBDAV_USER'),
+            webdavPass: must('WEBDAV_PASS'),
+            webdavRoot: must('WEBDAV_ROOT').replace(/\/$/, ''),
+            endpoint: must('OSS_ENDPOINT'),
+            bucket: must('OSS_BUCKET'),
+            accessKeyId: must('OSS_ACCESS_KEY_ID'),
+            accessKeySecret: must('OSS_ACCESS_KEY_SECRET'),
+            fileConcurrency: Number(process.env.FILE_CONCURRENCY || 3),
+            partConcurrency: Number(process.env.PART_CONCURRENCY || 8),
+            partSize: Number(process.env.PART_SIZE_MB || 64) * 1024 * 1024,
+            largeCutoff: Number(process.env.LARGE_FILE_MB || 128) * 1024 * 1024,
+          };
 
-      - name: Copy WebDAV directory contents to OSS bucket root
-        shell: bash
-        env:
-          WEBDAV_ROOT: ${{ secrets.WEBDAV_ROOT }}
-          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          TRANSFERS: ${{ inputs.transfers }}
-          CHECKERS: ${{ inputs.checkers }}
-        run: |
-          set -euo pipefail
-          # Put-only OSS credentials often cannot ListBucket or HEAD objects.
-          # These flags upload every source object directly instead of checking OSS first.
-          flags=(
-            --transfers "$TRANSFERS"
-            --checkers "$CHECKERS"
-            --multi-thread-streams 8
-            --multi-thread-cutoff 64M
-            --s3-upload-concurrency 8
-            --s3-chunk-size 64M
-            --buffer-size 32M
-            --use-mmap
-            --retries 1
-            --low-level-retries 10
-            --no-check-dest
-            --s3-no-check-bucket
-            --s3-no-head
-            --ignore-checksum
-            --s3-disable-checksum
-            --stats 15s
-            --stats-one-line
-            --progress
-            --create-empty-src-dirs
-          )
-          if [[ "$DRY_RUN" == "true" ]]; then
-            flags+=(--dry-run)
-          fi
-          rclone copy "webdavsrc:$WEBDAV_ROOT" "ossdst:$OSS_BUCKET/" "${flags[@]}"
+          function must(name) {
+            const value = process.env[name];
+            if (!value) throw new Error('Missing env ' + name);
+            return value;
+          }
+          const webdavAuth = 'Basic ' + Buffer.from(cfg.webdavUser + ':' + cfg.webdavPass).toString('base64');
+          const xmlDecode = s => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+          const encodePath = p => p.split('/').map((s, i) => i === 0 ? '' : encodeURIComponent(s)).join('/');
+          const ossEncode = s => encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+          const ossPath = key => '/' + key.split('/').map(ossEncode).join('/');
+          const hrefToPath = href => {
+            let h = xmlDecode(href.trim());
+            try { h = decodeURIComponent(h); } catch {}
+            if (h.startsWith('/webdav')) h = h.slice('/webdav'.length);
+            return h;
+          };
+          function canonicalizedOSSHeaders(headers) {
+            return Object.entries(headers)
+              .filter(([k]) => k.toLowerCase().startsWith('x-oss-'))
+              .map(([k, v]) => [k.toLowerCase(), String(v).trim()])
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([k, v]) => k + ':' + v + '\n')
+              .join('');
+          }
+          function sign(method, key, query = '', headers = {}, contentType = '', contentMd5 = '') {
+            const date = new Date().toUTCString();
+            headers.Date = date;
+            const resource = '/' + cfg.bucket + '/' + key + (query ? '?' + query : '');
+            const stringToSign = [method, contentMd5, contentType, date, canonicalizedOSSHeaders(headers) + resource].join('\n');
+            const sig = crypto.createHmac('sha1', cfg.accessKeySecret).update(stringToSign, 'utf8').digest('base64');
+            headers.Authorization = 'OSS ' + cfg.accessKeyId + ':' + sig;
+            if (contentType) headers['Content-Type'] = contentType;
+            return headers;
+          }
+          async function retry(name, fn, attempts = 5) {
+            let last;
+            for (let i = 1; i <= attempts; i++) {
+              try { return await fn(); } catch (e) {
+                last = e;
+                if (i === attempts) break;
+                const wait = Math.min(30000, 1000 * 2 ** (i - 1));
+                console.warn('retry', i, name, e.message, 'waiting', wait + 'ms');
+                await sleep(wait);
+              }
+            }
+            throw last;
+          }
+          async function webdavFetch(path, opts = {}) {
+            const res = await fetch(cfg.webdavUrl + encodePath(path), { ...opts, headers: { Authorization: webdavAuth, ...(opts.headers || {}) } });
+            if (!res.ok && res.status !== 206 && res.status !== 207) {
+              const body = await res.text().catch(() => '');
+              throw new Error((opts.method || 'GET') + ' WebDAV ' + path + ' -> ' + res.status + ' ' + body.slice(0, 300));
+            }
+            return res;
+          }
+          async function listDir(path) {
+            const p = path.endsWith('/') ? path : path + '/';
+            const res = await retry('PROPFIND ' + p, () => webdavFetch(p, { method: 'PROPFIND', headers: { Depth: '1' } }));
+            const text = await res.text();
+            const blocks = text.match(/<[^>]*response[\s\S]*?<\/[^>]*response>/gi) || [];
+            return blocks.map(b => {
+              const href = (b.match(/<[^>]*href[^>]*>([\s\S]*?)<\/[^>]*href>/i) || [])[1] || '';
+              const itemPath = hrefToPath(href);
+              const len = (b.match(/<[^>]*getcontentlength[^>]*>([\s\S]*?)<\/[^>]*getcontentlength>/i) || [])[1];
+              const resType = (b.match(/<[^>]*resourcetype[^>]*>([\s\S]*?)<\/[^>]*resourcetype>/i) || [])[1] || '';
+              const collection = /collection/i.test(resType) || itemPath.endsWith('/');
+              return { path: itemPath, collection, size: len ? Number(len) : 0 };
+            }).filter(x => x.path && x.path.replace(/\/$/, '') !== p.replace(/\/$/, ''));
+          }
+          async function collectFiles(root) {
+            const dirs = [root];
+            const files = [];
+            while (dirs.length) {
+              const dir = dirs.shift();
+              console.log('scan', dir);
+              for (const item of await listDir(dir)) {
+                if (item.collection) dirs.push(item.path);
+                else files.push(item);
+              }
+            }
+            return files;
+          }
+          function targetKey(srcPath) {
+            return srcPath.slice(cfg.webdavRoot.length).replace(/^\/+/, '');
+          }
+          async function ossRequest(method, key, query = '', headers = {}, body = undefined, contentType = '') {
+            const signed = sign(method, key, query, headers, contentType);
+            const url = 'https://' + cfg.bucket + '.' + cfg.endpoint + ossPath(key) + (query ? '?' + query : '');
+            const res = await fetch(url, { method, headers: signed, body });
+            if (!res.ok) {
+              const text = await res.text().catch(() => '');
+              throw new Error(method + ' OSS ' + key + (query ? '?' + query : '') + ' -> ' + res.status + ' ' + text.slice(0, 500));
+            }
+            return res;
+          }
+          async function readRange(path, start, end) {
+            const res = await retry('GET range ' + path + ' ' + start + '-' + end, () => webdavFetch(path, { headers: { Range: 'bytes=' + start + '-' + end } }));
+            return Buffer.from(await res.arrayBuffer());
+          }
+          async function uploadSmall(file, key) {
+            const buf = Buffer.from(await (await retry('GET ' + file.path, () => webdavFetch(file.path))).arrayBuffer());
+            await retry('PUT ' + key, () => ossRequest('PUT', key, '', {}, buf, 'application/octet-stream'));
+          }
+          async function initMultipart(key) {
+            const res = await retry('init multipart ' + key, () => ossRequest('POST', key, 'uploads', {}, undefined, ''));
+            const text = await res.text();
+            const uploadId = (text.match(/<UploadId>([\s\S]*?)<\/UploadId>/) || [])[1];
+            if (!uploadId) throw new Error('Missing UploadId for ' + key + ': ' + text.slice(0, 300));
+            return uploadId;
+          }
+          async function uploadPart(file, key, uploadId, partNumber, start, end) {
+            const buf = await readRange(file.path, start, end);
+            const query = 'partNumber=' + partNumber + '&uploadId=' + encodeURIComponent(uploadId);
+            const res = await retry('upload part ' + key + ' #' + partNumber, () => ossRequest('PUT', key, query, {}, buf, 'application/octet-stream'));
+            const etag = res.headers.get('etag');
+            if (!etag) throw new Error('Missing ETag for ' + key + ' part ' + partNumber);
+            return { partNumber, etag };
+          }
+          async function completeMultipart(key, uploadId, parts) {
+            parts.sort((a, b) => a.partNumber - b.partNumber);
+            const xml = '<CompleteMultipartUpload>' + parts.map(p => '<Part><PartNumber>' + p.partNumber + '</PartNumber><ETag>' + p.etag + '</ETag></Part>').join('') + '</CompleteMultipartUpload>';
+            await retry('complete multipart ' + key, () => ossRequest('POST', key, 'uploadId=' + encodeURIComponent(uploadId), {}, xml, 'application/xml'));
+          }
+          async function abortMultipart(key, uploadId) {
+            try { await ossRequest('DELETE', key, 'uploadId=' + encodeURIComponent(uploadId)); } catch (e) { console.warn('abort failed', key, e.message); }
+          }
+          async function uploadLarge(file, key) {
+            const uploadId = await initMultipart(key);
+            try {
+              const jobs = [];
+              let partNumber = 1;
+              for (let start = 0; start < file.size; start += cfg.partSize) {
+                const end = Math.min(file.size - 1, start + cfg.partSize - 1);
+                jobs.push({ partNumber: partNumber++, start, end });
+              }
+              const parts = [];
+              await runPool(jobs, cfg.partConcurrency, async job => {
+                const part = await uploadPart(file, key, uploadId, job.partNumber, job.start, job.end);
+                parts.push(part);
+                console.log('part', key, job.partNumber + '/' + jobs.length, Math.round((job.end + 1) / file.size * 100) + '%');
+              });
+              await completeMultipart(key, uploadId, parts);
+            } catch (e) {
+              await abortMultipart(key, uploadId);
+              throw e;
+            }
+          }
+          async function runPool(items, limit, worker) {
+            let index = 0;
+            const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+              while (index < items.length) {
+                const item = items[index++];
+                await worker(item);
+              }
+            });
+            await Promise.all(workers);
+          }
+          async function uploadFile(file) {
+            const key = targetKey(file.path);
+            const sizeMb = (file.size / 1024 / 1024).toFixed(1);
+            const started = Date.now();
+            console.log('upload start', key, sizeMb + 'MB');
+            if (file.size >= cfg.largeCutoff) await uploadLarge(file, key);
+            else await uploadSmall(file, key);
+            const sec = Math.max(0.001, (Date.now() - started) / 1000);
+            console.log('upload done', key, sizeMb + 'MB', (file.size / 1024 / 1024 / sec).toFixed(2) + 'MB/s');
+          }
+
+          console.log('config', JSON.stringify({ root: cfg.webdavRoot, bucket: cfg.bucket, endpoint: cfg.endpoint, fileConcurrency: cfg.fileConcurrency, partConcurrency: cfg.partConcurrency, partSizeMB: cfg.partSize / 1024 / 1024, largeFileMB: cfg.largeCutoff / 1024 / 1024 }));
+          const files = await collectFiles(cfg.webdavRoot);
+          const total = files.reduce((n, f) => n + f.size, 0);
+          console.log('found files', files.length, 'totalGB', (total / 1024 / 1024 / 1024).toFixed(2));
+          await runPool(files, cfg.fileConcurrency, uploadFile);
+          console.log('all uploads complete');
+          NODE
+          node migrate.mjs
