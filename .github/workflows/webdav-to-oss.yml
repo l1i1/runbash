@@ -19,6 +19,14 @@ on:
         description: "Use multipart when file is at least this MB"
         required: false
         default: "128"
+      skip_existing:
+        description: "Skip OSS objects with the same byte size"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -44,6 +52,7 @@ jobs:
       PART_CONCURRENCY: ${{ inputs.part_concurrency }}
       PART_SIZE_MB: ${{ inputs.part_size_mb }}
       LARGE_FILE_MB: ${{ inputs.large_file_mb }}
+      SKIP_EXISTING: ${{ inputs.skip_existing }}
     steps:
       - name: Native WebDAV to OSS multipart upload
         shell: bash
@@ -66,6 +75,7 @@ jobs:
             partConcurrency: Number(process.env.PART_CONCURRENCY || 8),
             partSize: Number(process.env.PART_SIZE_MB || 64) * 1024 * 1024,
             largeCutoff: Number(process.env.LARGE_FILE_MB || 128) * 1024 * 1024,
+            skipExisting: (process.env.SKIP_EXISTING || 'true') === 'true',
           };
 
           function must(name) {
@@ -163,11 +173,25 @@ jobs:
             }
             return res;
           }
+          async function headObject(key) {
+            const signed = sign('HEAD', key);
+            const url = 'https://' + cfg.bucket + '.' + cfg.endpoint + ossPath(key);
+            const res = await fetch(url, { method: 'HEAD', headers: signed });
+            if (res.ok) return { exists: true, size: Number(res.headers.get('content-length') || -1) };
+            if (res.status === 404) return { exists: false, size: -1 };
+            if (res.status === 403) return { exists: null, size: -1 };
+            const text = await res.text().catch(() => '');
+            throw new Error('HEAD OSS ' + key + ' -> ' + res.status + ' ' + text.slice(0, 300));
+          }
           async function readRange(path, start, end) {
             const res = await retry('GET range ' + path + ' ' + start + '-' + end, () => webdavFetch(path, { headers: { Range: 'bytes=' + start + '-' + end } }));
             return Buffer.from(await res.arrayBuffer());
           }
           async function uploadSmall(file, key) {
+            if (file.size === 0) {
+              await retry('PUT empty ' + key, () => ossRequest('PUT', key, '', {}, Buffer.alloc(0), 'application/octet-stream'));
+              return;
+            }
             const buf = Buffer.from(await (await retry('GET ' + file.path, () => webdavFetch(file.path))).arrayBuffer());
             await retry('PUT ' + key, () => ossRequest('PUT', key, '', {}, buf, 'application/octet-stream'));
           }
@@ -229,6 +253,13 @@ jobs:
             const key = targetKey(file.path);
             const sizeMb = (file.size / 1024 / 1024).toFixed(1);
             const started = Date.now();
+            if (cfg.skipExisting) {
+              const head = await retry('HEAD ' + key, () => headObject(key), 2);
+              if (head.exists === true && head.size === file.size) {
+                console.log('skip existing', key, sizeMb + 'MB');
+                return;
+              }
+            }
             console.log('upload start', key, sizeMb + 'MB');
             if (file.size >= cfg.largeCutoff) await uploadLarge(file, key);
             else await uploadSmall(file, key);
@@ -236,7 +267,7 @@ jobs:
             console.log('upload done', key, sizeMb + 'MB', (file.size / 1024 / 1024 / sec).toFixed(2) + 'MB/s');
           }
 
-          console.log('config', JSON.stringify({ root: cfg.webdavRoot, bucket: cfg.bucket, endpoint: cfg.endpoint, fileConcurrency: cfg.fileConcurrency, partConcurrency: cfg.partConcurrency, partSizeMB: cfg.partSize / 1024 / 1024, largeFileMB: cfg.largeCutoff / 1024 / 1024 }));
+          console.log('config', JSON.stringify({ root: cfg.webdavRoot, bucket: cfg.bucket, endpoint: cfg.endpoint, fileConcurrency: cfg.fileConcurrency, partConcurrency: cfg.partConcurrency, partSizeMB: cfg.partSize / 1024 / 1024, largeFileMB: cfg.largeCutoff / 1024 / 1024, skipExisting: cfg.skipExisting }));
           const files = await collectFiles(cfg.webdavRoot);
           const total = files.reduce((n, f) => n + f.size, 0);
           console.log('found files', files.length, 'totalGB', (total / 1024 / 1024 / 1024).toFixed(2));
