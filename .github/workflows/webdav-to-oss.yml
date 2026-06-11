@@ -27,13 +27,18 @@ on:
         options:
           - "true"
           - "false"
+      shard_total:
+        description: "Total parallel shards"
+        required: false
+        default: "1"
+      shard_index:
+        description: "This shard index, 0-based"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
 
-concurrency:
-  group: webdav-to-oss
-  cancel-in-progress: false
 
 jobs:
   migrate:
@@ -53,6 +58,8 @@ jobs:
       PART_SIZE_MB: ${{ inputs.part_size_mb }}
       LARGE_FILE_MB: ${{ inputs.large_file_mb }}
       SKIP_EXISTING: ${{ inputs.skip_existing }}
+      SHARD_TOTAL: ${{ inputs.shard_total }}
+      SHARD_INDEX: ${{ inputs.shard_index }}
     steps:
       - name: Native WebDAV to OSS multipart upload
         shell: bash
@@ -76,6 +83,8 @@ jobs:
             partSize: Number(process.env.PART_SIZE_MB || 64) * 1024 * 1024,
             largeCutoff: Number(process.env.LARGE_FILE_MB || 128) * 1024 * 1024,
             skipExisting: (process.env.SKIP_EXISTING || 'true') === 'true',
+            shardTotal: Math.max(1, Number(process.env.SHARD_TOTAL || 1)),
+            shardIndex: Math.max(0, Number(process.env.SHARD_INDEX || 0)),
           };
 
           function must(name) {
@@ -267,10 +276,12 @@ jobs:
             console.log('upload done', key, sizeMb + 'MB', (file.size / 1024 / 1024 / sec).toFixed(2) + 'MB/s');
           }
 
-          console.log('config', JSON.stringify({ root: cfg.webdavRoot, bucket: cfg.bucket, endpoint: cfg.endpoint, fileConcurrency: cfg.fileConcurrency, partConcurrency: cfg.partConcurrency, partSizeMB: cfg.partSize / 1024 / 1024, largeFileMB: cfg.largeCutoff / 1024 / 1024, skipExisting: cfg.skipExisting }));
-          const files = await collectFiles(cfg.webdavRoot);
+          console.log('config', JSON.stringify({ root: cfg.webdavRoot, bucket: cfg.bucket, endpoint: cfg.endpoint, fileConcurrency: cfg.fileConcurrency, partConcurrency: cfg.partConcurrency, partSizeMB: cfg.partSize / 1024 / 1024, largeFileMB: cfg.largeCutoff / 1024 / 1024, skipExisting: cfg.skipExisting, shardTotal: cfg.shardTotal, shardIndex: cfg.shardIndex }));
+          const allFiles = await collectFiles(cfg.webdavRoot);
+          if (cfg.shardIndex >= cfg.shardTotal) throw new Error('shard_index must be less than shard_total');
+          const files = allFiles.filter(f => shardOf(targetKey(f.path)) === cfg.shardIndex);
           const total = files.reduce((n, f) => n + f.size, 0);
-          console.log('found files', files.length, 'totalGB', (total / 1024 / 1024 / 1024).toFixed(2));
+          console.log('found files', allFiles.length, 'selected', files.length, 'shard', cfg.shardIndex + '/' + cfg.shardTotal, 'selectedGB', (total / 1024 / 1024 / 1024).toFixed(2));
           await runPool(files, cfg.fileConcurrency, uploadFile);
           console.log('all uploads complete');
           NODE
