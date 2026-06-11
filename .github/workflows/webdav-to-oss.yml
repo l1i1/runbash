@@ -52,7 +52,6 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.config/rclone
           WEBDAV_OBSCURED_PASS="$(rclone obscure "$WEBDAV_PASS")"
-          OSS_OBSCURED_SECRET="$(rclone obscure "$OSS_ACCESS_KEY_SECRET")"
           cat > ~/.config/rclone/rclone.conf <<EOF
           [webdavsrc]
           type = webdav
@@ -66,14 +65,14 @@ jobs:
           provider = Alibaba
           env_auth = false
           access_key_id = $OSS_ACCESS_KEY_ID
-          secret_access_key = $OSS_OBSCURED_SECRET
+          secret_access_key = $OSS_ACCESS_KEY_SECRET
           endpoint = $OSS_ENDPOINT
           region = $OSS_REGION
           acl = private
           no_check_bucket = true
           EOF
 
-      - name: Sync WebDAV directory contents to OSS bucket root
+      - name: Copy WebDAV directory contents to OSS bucket root
         shell: bash
         env:
           WEBDAV_ROOT: ${{ secrets.WEBDAV_ROOT }}
@@ -103,4 +102,4 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             flags+=(--dry-run)
           fi
-          rclone sync "webdavsrc:$WEBDAV_ROOT" "ossdst:$OSS_BUCKET/" "${flags[@]}"
+          rclone copy "webdavsrc:$WEBDAV_ROOT" "ossdst:$OSS_BUCKET/" "${flags[@]}"
