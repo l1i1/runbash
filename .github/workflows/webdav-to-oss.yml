@@ -66,6 +66,7 @@ jobs:
           env_auth = false
           access_key_id = $OSS_ACCESS_KEY_ID
           secret_access_key = $OSS_ACCESS_KEY_SECRET
+          # Use the OSS regional endpoint for S3 signing. OSS custom domain provided by user: vhbs.top
           endpoint = $OSS_ENDPOINT
           region = $OSS_REGION
           acl = private
