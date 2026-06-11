@@ -83,8 +83,9 @@ jobs:
           CHECKERS: ${{ inputs.checkers }}
         run: |
           set -euo pipefail
+          # Put-only OSS credentials often cannot ListBucket or HEAD objects.
+          # These flags upload every source object directly instead of checking OSS first.
           flags=(
-            --fast-list
             --transfers "$TRANSFERS"
             --checkers "$CHECKERS"
             --multi-thread-streams 8
@@ -93,8 +94,13 @@ jobs:
             --s3-chunk-size 64M
             --buffer-size 32M
             --use-mmap
-            --retries 10
-            --low-level-retries 20
+            --retries 1
+            --low-level-retries 10
+            --no-check-dest
+            --s3-no-check-bucket
+            --s3-no-head
+            --ignore-checksum
+            --s3-disable-checksum
             --stats 15s
             --stats-one-line
             --progress
